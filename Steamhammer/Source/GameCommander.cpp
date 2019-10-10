@@ -2,8 +2,7 @@
 #include "GameCommander.h"
 #include "OpponentModel.h"
 #include "UnitUtil.h"
-
-namespace { auto & bwemMap = BWEM::Map::Instance(); }
+#include "PathFinding.h"
 
 using namespace UAlbertaBot;
 
@@ -140,6 +139,20 @@ void GameCommander::update()
 	}
 
 	drawDebugInterface();
+
+    if (BWAPI::Broodwar->getFrameCount() % 2000 == 1999)
+    {
+        int count = 0;
+        for (const auto unit : BWAPI::Broodwar->self()->getUnits())
+        {
+            if (UnitUtil::IsCombatUnit(unit) && unit->isCompleted())
+            {
+                ++count;
+            }
+        }
+
+        Log().Get() << "Summary: " << count << " combat units, " << UnitUtil::GetCompletedUnitCount(BWAPI::UnitTypes::Protoss_Probe) << " workers, " << BWAPI::Broodwar->self()->minerals() << " minerals, " << BWAPI::Broodwar->self()->gas() << " gas";
+    }
 }
 
 void GameCommander::drawDebugInterface()
@@ -400,6 +413,12 @@ void GameCommander::surrender()
 	_surrenderTime = BWAPI::Broodwar->getFrameCount();
 }
 
+void GameCommander::onEnd(bool isWinner)
+{
+    OpponentModel::Instance().setWin(isWinner);
+    OpponentModel::Instance().write();
+}
+
 void GameCommander::onUnitShow(BWAPI::Unit unit)			
 { 
 	InformationManager::Instance().onUnitShow(unit); 
@@ -455,8 +474,7 @@ BWAPI::Unit GameCommander::getScoutWorker()
 			!unit->isCarryingGas() &&
 			unit->getOrder() != BWAPI::Orders::MiningMinerals)
 		{
-            int dist;
-            bwemMap.GetPath(unit->getPosition(), mapCenter, &dist);
+            int dist = PathFinding::GetGroundDistance(unit->getPosition(), mapCenter);
 			if (dist < bestDist)
 			{
 				bestDist = dist;

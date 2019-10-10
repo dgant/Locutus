@@ -1,6 +1,7 @@
 #include "Micro.h"
 #include "MapGrid.h"
 #include "UnitUtil.h"
+#include "MapTools.h"
 
 const double pi = 3.14159265358979323846;
 
@@ -163,7 +164,14 @@ void Micro::Move(BWAPI::Unit attacker, const BWAPI::Position & targetPosition)
     }
 
     // if nothing prevents it, move the target position
-	attacker->move(targetPosition);
+	//如果没有任何阻碍，移动目标位置
+	if (!attacker->hasPath(targetPosition)) {
+		attacker->move(MapTools::Instance().getDistancePosition(attacker->getPosition(), targetPosition, 4 * 32));
+	}
+	else {
+		attacker->move(targetPosition);
+	}
+	
     TotalCommands++;
 
     if (Config::Debug::DrawUnitTargetInfo) 
@@ -212,6 +220,41 @@ void Micro::RightClick(BWAPI::Unit unit, BWAPI::Unit target)
         BWAPI::Broodwar->drawCircleMap(target->getPosition(), dotRadius, BWAPI::Colors::Cyan, true);
         BWAPI::Broodwar->drawLineMap(unit->getPosition(), target->getPosition(), BWAPI::Colors::Cyan);
     }
+}
+
+void Micro::RightClick(BWAPI::Unit unit, BWAPI::Position pos)
+{
+	if (!unit || !unit->exists() || unit->getPlayer() != BWAPI::Broodwar->self())
+	{
+		UAB_ASSERT(false, "bad arg");
+		return;
+	}
+
+	// if we have issued a command to this unit already this frame, ignore this one
+	if (unit->getLastCommandFrame() >= BWAPI::Broodwar->getFrameCount() || unit->isAttackFrame())
+	{
+		return;
+	}
+
+	// get the unit's current command
+	BWAPI::UnitCommand currentCommand(unit->getLastCommand());
+
+	// if we've already told this unit to right-click this target, ignore this command
+	if ((currentCommand.getType() == BWAPI::UnitCommandTypes::Right_Click_Unit) && (currentCommand.getTargetPosition() == pos) && BWAPI::Broodwar->getFrameCount() < unit->getLastCommandFrame() + 12)
+	{
+		return;
+	}
+
+	// if nothing prevents it, attack the target
+	unit->rightClick(pos);
+	TotalCommands++;
+
+	if (Config::Debug::DrawUnitTargetInfo)
+	{
+		BWAPI::Broodwar->drawCircleMap(unit->getPosition(), dotRadius, BWAPI::Colors::Cyan, true);
+		BWAPI::Broodwar->drawCircleMap(pos, dotRadius, BWAPI::Colors::Cyan, true);
+		BWAPI::Broodwar->drawLineMap(unit->getPosition(), pos, BWAPI::Colors::Cyan);
+	}
 }
 
 void Micro::LaySpiderMine(BWAPI::Unit unit, BWAPI::Position pos)
@@ -405,6 +448,7 @@ void Micro::ReturnCargo(BWAPI::Unit worker)
 	TotalCommands++;
 }
 
+/*
 void Micro::KiteTarget(BWAPI::Unit rangedUnit, BWAPI::Unit target)
 {
 	// The always-kite units are have their own micro.
@@ -487,6 +531,196 @@ void Micro::KiteTarget(BWAPI::Unit rangedUnit, BWAPI::Unit target)
 	else
 	{
 		// Shoot.
+		Micro::AttackUnit(rangedUnit, target);
+	}
+}
+*/
+
+void Micro::KiteTarget(BWAPI::Unit rangedUnit, BWAPI::Unit target)
+{
+	// If the unit is still in its attack animation, don't touch it
+	//如果该单位仍然在其攻击动画，不要碰它
+	if (!InformationManager::Instance().getLocutusUnit(rangedUnit).isReady())
+		return;
+
+	// If the unit can't move, don't kite
+	double speed = rangedUnit->getType().topSpeed();
+	if (speed < 0.001)
+	{
+		Micro::AttackUnit(rangedUnit, target);
+		return;
+	}
+
+	// Our unit range
+	int range(rangedUnit->getType().groundWeapon().maxRange());
+	if (rangedUnit->getType() == BWAPI::UnitTypes::Protoss_Dragoon &&
+		BWAPI::Broodwar->self()->getUpgradeLevel(BWAPI::UpgradeTypes::Singularity_Charge))
+	{
+		range = 6 * 32;
+	}
+
+	int distToTarget = rangedUnit->getDistance(target);
+
+	// If our weapon is ready to fire, attack
+	int cooldown = rangedUnit->getGroundWeaponCooldown() - BWAPI::Broodwar->getRemainingLatencyFrames() - 2;
+	int framesToFiringRange = std::max(0, distToTarget - range) / speed;
+	if (cooldown <= framesToFiringRange)
+	{
+		Micro::AttackUnit(rangedUnit, target);
+		return;
+	}
+
+	// If the target is behind a wall, don't kite
+	//如果目标在墙后，不要放风筝
+	if (InformationManager::Instance().isBehindEnemyWall(rangedUnit, target))
+	{
+		Micro::AttackUnit(rangedUnit, target);
+		return;
+	}
+
+	// Compute target unit range
+	int targetRange(target->getType().groundWeapon().maxRange());
+	if (InformationManager::Instance().enemyHasInfantryRangeUpgrade())
+	{
+		if (target->getType() == BWAPI::UnitTypes::Terran_Marine ||
+			target->getType() == BWAPI::UnitTypes::Zerg_Hydralisk)
+		{
+			targetRange = 5 * 32;
+		}
+		else if (target->getType() == BWAPI::UnitTypes::Protoss_Dragoon)
+		{
+			targetRange = 6 * 32;
+		}
+	}
+
+	// Kite by default
+	bool kite = true;
+
+	// Move towards the target in the following cases:
+	// - It is a sieged tank
+	// - It is repairing a sieged tank
+	// - It is a building that cannot attack
+	// - We are blocking a narrow choke
+	// - The enemy unit is moving away from us and is close to the edge of its range, or is standing still and we aren't in its weapon range
+	//在以下情况下向目标移动:
+	// -这是一辆围攻坦克
+	// -它正在修理一辆被围攻的坦克
+	// -这是一座无法攻击的建筑
+	// -我们堵住了一条狭窄的咽喉
+	// -敌人正在远离我们，接近它的射程边缘，或者静止不动，我们不在它的武器射程之内
+
+	// Do simple checks immediately
+	//立即做简单的检查
+	bool moveCloser =
+		target->getType() == BWAPI::UnitTypes::Terran_Siege_Tank_Siege_Mode ||
+		(target->isRepairing() && target->getOrderTarget() && target->getOrderTarget()->getType() == BWAPI::UnitTypes::Terran_Siege_Tank_Siege_Mode) ||
+		(target->getType().isBuilding() && !UnitUtil::CanAttack(target, rangedUnit));
+
+	// Now check enemy unit movement
+	//现在检查敌人单位的移动
+	if (!moveCloser)
+	{
+		BWAPI::Position predictedPosition = InformationManager::Instance().predictUnitPosition(target, 1);
+		if (predictedPosition.isValid())
+		{
+			int distPredicted = rangedUnit->getDistance(predictedPosition);
+			int distCurrent = rangedUnit->getDistance(target->getPosition());
+
+			// Enemy is moving away from us: don't kite
+			if (distPredicted > distCurrent)
+			{
+				kite = false;
+
+				// If the enemy is close to being out of our attack range, move closer
+				//如果敌人超出我们的攻击范围，就靠近点
+				if (distToTarget > (range - 32))
+				{
+					moveCloser = true;
+				}
+			}
+
+			// Enemy is standing still: move a bit closer if we outrange it
+			// The idea is to move forward just enough to let friendly units move into range behind us
+			else if (distCurrent == distPredicted &&
+				range >= (targetRange + 64) &&
+				distToTarget > (range - 48))
+			{
+				moveCloser = true;
+			}
+		}
+	}
+
+	// Now check for blocking a choke
+	if (!moveCloser)
+	{
+		for (BWTA::Chokepoint * choke : BWTA::getChokepoints())
+		{
+			if (choke->getWidth() < 64 &&
+				rangedUnit->getDistance(choke->getCenter()) < 96)
+			{
+				// We're close to a choke, find out if there are friendly units behind us
+
+				// Start by computing the angle of the choke
+				BWAPI::Position chokeDelta(choke->getSides().first - choke->getSides().second);
+				double chokeAngle = atan2(chokeDelta.y, chokeDelta.x);
+
+				// Now find points ahead and behind us with respect to the choke
+				// We'll find out which is which in a moment
+				BWAPI::Position first(
+					rangedUnit->getPosition().x - (int)std::round(48 * std::cos(chokeAngle + (pi / 2.0))),
+					rangedUnit->getPosition().y - (int)std::round(48 * std::sin(chokeAngle + (pi / 2.0))));
+				BWAPI::Position second(
+					rangedUnit->getPosition().x - (int)std::round(48 * std::cos(chokeAngle - (pi / 2.0))),
+					rangedUnit->getPosition().y - (int)std::round(48 * std::sin(chokeAngle - (pi / 2.0))));
+
+				// Find out which position is behind us
+				BWAPI::Position position = first;
+				if (target->getDistance(second) > target->getDistance(first))
+					position = second;
+
+				// Move closer if there is a friendly unit near the position
+				moveCloser =
+					InformationManager::Instance().getMyUnitGrid().get(position) > 0 ||
+					InformationManager::Instance().getMyUnitGrid().get(position + BWAPI::Position(-16, -16)) > 0 ||
+					InformationManager::Instance().getMyUnitGrid().get(position + BWAPI::Position(16, -16)) > 0 ||
+					InformationManager::Instance().getMyUnitGrid().get(position + BWAPI::Position(16, 16)) > 0 ||
+					InformationManager::Instance().getMyUnitGrid().get(position + BWAPI::Position(-16, 16)) > 0;
+				break;
+			}
+		}
+	}
+
+	// Execute move closer
+	//执行靠近
+	if (moveCloser)
+	{
+		if (distToTarget > 16)
+		{
+			InformationManager::Instance().getLocutusUnit(rangedUnit).moveTo(target->getPosition());
+		}
+		else
+		{
+			Micro::AttackUnit(rangedUnit, target);
+		}
+
+		return;
+	}
+
+	//如果我们的射程比对方远，但进入了对方的攻击范围，则后退
+	if (range > targetRange && rangedUnit->getDistance(target->getPosition()) <= targetRange) {
+		//BWAPI::Position fleePosition = getFleePosition(rangedUnit, target);
+		//Micro::RightClick(rangedUnit, fleePosition);
+		InformationManager::Instance().getLocutusUnit(rangedUnit).fleeFrom(target->getPosition());
+		return;
+	}
+
+	// Execute kite
+	if (kite)
+	{
+		InformationManager::Instance().getLocutusUnit(rangedUnit).fleeFrom(target->getPosition());
+	}
+	else
+	{
 		Micro::AttackUnit(rangedUnit, target);
 	}
 }

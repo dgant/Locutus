@@ -155,7 +155,10 @@ void ScoutManager::update()
     }
 
 	// Find out if we want to steal gas.
-	if (_workerScout && !StrategyManager::Instance().isRushing() && OpponentModel::Instance().getRecommendGasSteal() &&
+	if (_workerScout && 
+        !StrategyManager::Instance().isRushing() && 
+        OpponentModel::Instance().getRecommendGasSteal() &&
+        BWAPI::Broodwar->enemy()->getRace() != BWAPI::Races::Zerg &&
         Config::Strategy::StrategyName != "PlasmaProxy2Gate")
 	{
 		_tryGasSteal = true;
@@ -169,8 +172,18 @@ void ScoutManager::update()
 		releaseWorkerScout();
 	}
 
+    // If the worker scout is blocked outside a wall, release it.
+    if (_workerScout &&
+        InformationManager::Instance().getEnemyMainBaseLocation() &&
+        InformationManager::Instance().isBehindEnemyWall(InformationManager::Instance().getEnemyMainBaseLocation()->getTilePosition()) &&
+        !InformationManager::Instance().isBehindEnemyWall(_workerScout->getTilePosition()))
+    {
+        releaseWorkerScout();
+    }
+
     // If we want to scout while safe, and the scout is no longer safe, release it
-    if (_workerScout && _scoutCommand == MacroCommandType::ScoutWhileSafe)
+    if (_workerScout && _scoutCommand == MacroCommandType::ScoutWhileSafe &&
+        !InformationManager::Instance().isBehindEnemyWall(_workerScout->getTilePosition()))
     {
         bool scoutSafe = _workerScout->getHitPoints() > BWAPI::UnitTypes::Protoss_Probe.maxHitPoints() / 2;
         if (scoutSafe)
@@ -526,6 +539,14 @@ bool ScoutManager::gasSteal()
 		return false;
 	}
 
+    // Abort the gas steal if we've scouted a rush
+    OpeningPlan enemyPlan = OpponentModel::Instance().getEnemyPlan();
+    if (enemyPlan == OpeningPlan::FastRush || enemyPlan == OpeningPlan::HeavyRush)
+    {
+        _gasStealOver = true;
+        return false;
+    }
+
 	// The conditions are met. Do it!
 	_startedGasSteal = true;
 
@@ -537,7 +558,7 @@ bool ScoutManager::gasSteal()
 		// No need to set status. It will change on the next frame.
 		return false;
 	}
-	else if (_enemyGeyser->isVisible() && _workerScout->getDistance(_enemyGeyser) < 300)
+	else if (_enemyGeyser->isVisible() && _workerScout->getDistance(_enemyGeyser) < 64)
 	{
 		// We see the geyser. Queue the refinery, if it's not already done.
 		// We can't rely on _queuedGasSteal to know, because the queue may be cleared
@@ -560,7 +581,7 @@ bool ScoutManager::gasSteal()
 	else
 	{
 		// We don't see the geyser yet. Move toward it.
-		Micro::Move(_workerScout, _enemyGeyser->getInitialPosition());
+        InformationManager::Instance().getLocutusUnit(_workerScout).moveTo(_enemyGeyser->getInitialPosition());
 		_gasStealStatus = "Moving to steal gas";
 	}
 	return true;

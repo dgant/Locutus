@@ -7,6 +7,8 @@
     using System.IO;
     using System.Linq;
     using System.Threading;
+    using Docker.DotNet;
+    using Docker.DotNet.Models;
     using Newtonsoft.Json;
 
     public class Program
@@ -66,6 +68,8 @@
 
         private static readonly Dictionary<string, string> LogCache = new Dictionary<string, string>();
 
+        private static DockerClient dockerClient;
+
         // State for current game
         private static GameData currentGame;
 
@@ -75,10 +79,15 @@
 
         private static int crashes;
 
+        private static int timeouts;
+
         private static StreamWriter logFile = null;
 
         public static void Main(string[] args)
         {
+            dockerClient = new DockerClientConfiguration(new Uri("npipe://./pipe/docker_engine"))
+                .CreateClient();
+
             Go(args);
 
 #if DEBUG
@@ -93,6 +102,7 @@
             var opponent = args[0];
             var isHeadless = !args.Contains("ui");
             var showReplay = args.Contains("replay");
+            var noOverwrite = args.Contains("noReadOverwrite");
 
             var timeout = MaxTimeout;
             if (args.Contains("short"))
@@ -163,20 +173,24 @@
 
             if (args.Contains("trainingrun"))
             {
-                if (!File.Exists("opponents.csv"))
+                List<string> trainingOpponents;
+                string outputFilename;
+                if (File.Exists(opponent))
                 {
-                    Console.WriteLine("Error: no opponents.csv file found for training run");
-                    return;
+                    trainingOpponents = File.ReadAllLines(opponent)
+                        .Where(x => !string.IsNullOrWhiteSpace(x) && !x.StartsWith("-"))
+                        .ToList();
+                    outputFilename = "trainingrun-" + Path.GetFileNameWithoutExtension(opponent) + "-" + DateTime.Now.ToString("yyyy-MM-dd-HH-mm-ss");
+                }
+                else
+                {
+                    trainingOpponents = new List<string> { opponent };
+                    outputFilename = "trainingrun-" + opponent + "-" + DateTime.Now.ToString("yyyy-MM-dd-HH-mm-ss");
                 }
 
-                var filename = "trainingrun-" + DateTime.Now.ToString("yyyy-MM-dd-HH-mm-ss");
-                logFile = File.CreateText(filename + ".log");
-                var outputFilename = filename + ".csv";
-                File.AppendAllText(outputFilename, "Opponent;Map;Game ID;My Strategy;Opponent Strategy;Result\n");
-
-                var trainingOpponents = File.ReadAllLines("opponents.csv")
-                    .Where(x => !string.IsNullOrWhiteSpace(x) && !x.StartsWith("-"))
-                    .ToList();
+                logFile = File.CreateText(outputFilename + ".log");
+                var resultsFilename = outputFilename + ".csv";
+                File.AppendAllText(resultsFilename, "Opponent;Map;Game ID;My Strategy;Expected Opponent Strategy;Observed Opponent Strategy;Result\n");
 
                 while (true)
                 {
@@ -186,7 +200,7 @@
 
                     // Set the timeout
                     timeout = MaxTimeout;
-                    if (trainingOpponent.Length > 0)
+                    if (trainingOpponent.Length > 1)
                     {
                         if (trainingOpponent[1] == "short")
                         {
@@ -206,17 +220,12 @@
                         }
                     }
 
-                    Run(trainingOpponent[0], map, true, false, timeout);
-
-                    if (!currentGame.HaveResult)
-                    {
-                        crashes++;
-                    }
+                    Run(trainingOpponent[0], map, true, false, timeout, noOverwrite);
 
                     var result = currentGame.HaveResult ? (currentGame.Won ? "win" : "loss") : "crash";
-                    File.AppendAllText(outputFilename, $"{trainingOpponent[0]};{map};{currentGame.Id};{currentGame.MyStrategy};{currentGame.OpponentStrategy};{result}\n");
+                    File.AppendAllText(resultsFilename, $"{trainingOpponent[0]};{map};{currentGame.Id};{currentGame.MyStrategy};{currentGame.ExpectedOpponentStrategy};{currentGame.OpponentStrategy};{result}\n");
 
-                    Output("Overall score is {0} wins {1} losses {2} crashes/timeouts", wins, losses, crashes);
+                    Output("Overall score is {0} wins {1} losses {2} crashes {3} timeouts", wins, losses, crashes, timeouts);
                     logFile.Flush();
                 }
             }
@@ -228,14 +237,9 @@
 
                 foreach (var map in shuffledMaps)
                 {
-                    Run(opponent, map, isHeadless, false, timeout);
+                    Run(opponent, map, isHeadless, false, timeout, noOverwrite);
 
-                    if (!currentGame.HaveResult)
-                    {
-                        crashes++;
-                    }
-
-                    Output("Score is {0} wins {1} losses {2} crashes/timeouts", wins, losses, crashes);
+                    Output("Score is {0} wins {1} losses {2} crashes {3} timeouts", wins, losses, crashes, timeouts);
 
                     count++;
                     if (count >= limit) break;
@@ -244,16 +248,17 @@
                 return;
             }
 
-            Run(opponent, shuffledMaps.First(), isHeadless, showReplay, timeout);
+            Run(opponent, shuffledMaps.First(), isHeadless, showReplay, timeout, noOverwrite);
         }
 
-        private static void Run(string opponent, string map, bool isHeadless, bool showReplay, int timeout)
+        private static void Run(string opponent, string map, bool isHeadless, bool showReplay, int timeout, bool noOverwrite)
         {
             Output("Starting game against {0} on {1}", opponent, map);
 
             var headless = isHeadless ? "--headless" : string.Empty;
             var timeoutParam = timeout > 0 ? "--timeout " + timeout : string.Empty;
-            var args = $"--bots \"Locutus\" \"{opponent}\" --game_speed 0 {headless} --vnc_host localhost --map \"{map}\" {timeoutParam} --read_overwrite";
+            var overwriteParam = noOverwrite ? string.Empty : "--read_overwrite";
+            var args = $"--bots \"Locutus\" \"{opponent}\" --game_speed 0 {headless} --vnc_host localhost --map \"{map}\" {timeoutParam} {overwriteParam}";
 
             currentGame = new GameData();
 
@@ -307,6 +312,29 @@
             }
 
             ProcessOutputFiles(opponent, map, showReplay);
+
+            if (!currentGame.HaveResult)
+            {
+                Output("Result: Timeout");
+                timeouts++;
+            }
+            else if (currentGame.Won)
+            {
+                Output("Result: Won");
+                wins++;
+            }
+            else if (currentGame.Crashed)
+            {
+                Output("Result: Crashed");
+                crashes++;
+            }
+            else
+            {
+                Output("Result: Loss");
+                losses++;
+            }
+
+            KillContainers();
         }
 
         private static void ProcessOutputFiles(string opponent, string map, bool showReplay)
@@ -326,7 +354,7 @@
 
         private static void HandleResults(string file, bool mine)
         {
-            if (currentGame.HaveResult)
+            if (currentGame.HaveResult && (!mine || !currentGame.Crashed))
             {
                 return;
             }
@@ -343,17 +371,14 @@
                 currentGame.HaveResult = true;
                 currentGame.ResultTimestamp = DateTime.UtcNow;
                 currentGame.Won = mine ? results.IsWinner : !results.IsWinner;
-
-                if (currentGame.Won)
+                if (mine)
                 {
-                    Output("Result: Won");
-                    wins++;
+                    currentGame.Crashed = false;
                 }
-                else
-                {
-                    Output("Result: Loss");
-                    losses++;
-                }
+            }
+            else if (mine)
+            {
+                currentGame.Crashed = true;
             }
         }
 
@@ -403,7 +428,15 @@
 
                 if (line.Contains(": Opponent: "))
                 {
-                    currentGame.OpponentStrategy = line.Substring(line.IndexOf(": Opponent: ", StringComparison.InvariantCulture) + 12);
+                    var strategy = line.Substring(line.IndexOf(": Opponent: ", StringComparison.InvariantCulture) + 12);
+                    if (strategy.StartsWith("expect "))
+                    {
+                        currentGame.ExpectedOpponentStrategy = strategy.Substring(7);
+                    }
+                    else
+                    {
+                        currentGame.OpponentStrategy = strategy;
+                    }
                 }
 
                 Output($"{DateTime.Now:HH:mm:ss} {prefix}{line}");
@@ -539,8 +572,52 @@
 
         private static void Output(string format, params object[] args)
         {
-            Console.WriteLine(format, args);
-            logFile?.WriteLine(format, args);
+            if (args.Any())
+            {
+                try
+                {
+                    Console.WriteLine(format, args);
+                    logFile?.WriteLine(format, args);
+                    return;
+                }
+                catch (FormatException)
+                {
+                    // Fall through and output the raw text
+                }
+            }
+
+            Console.WriteLine(format);
+            logFile?.WriteLine(format);
+        }
+
+        private static void KillContainers()
+        {
+            Thread.Sleep(1000);
+
+            var runningContainers = dockerClient.Containers.ListContainersAsync(
+                new ContainersListParameters
+                    {
+                        All = true,
+                        Filters = 
+                            new Dictionary<string, IDictionary<string, bool>>
+                                {
+                                    {
+                                        "status", new Dictionary<string, bool>
+                                                      {
+                                                          {
+                                                              "running",
+                                                              true
+                                                          }
+                                                      }
+                                          }
+                                      }
+                    }).GetAwaiter().GetResult();
+
+            foreach (var container in runningContainers.Where(x => x.Names.Any(n => n.Contains(currentGame.Id))))
+            {
+                dockerClient.Containers.StopContainerAsync(container.ID, new ContainerStopParameters());
+                Console.WriteLine("Stopped container {0}", container.Names[0]);
+            }
         }
 
         private class GameData
@@ -553,11 +630,15 @@
 
             public DateTime ResultTimestamp { get; set; }
 
+            public bool Crashed { get; set; }
+
             public bool Won { get; set; }
 
             public bool RenamedReplay { get; set; }
 
             public string MyStrategy { get; set; }
+
+            public string ExpectedOpponentStrategy { get; set; }
 
             public string OpponentStrategy { get; set; }
         }

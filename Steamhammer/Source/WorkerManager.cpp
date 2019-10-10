@@ -313,7 +313,7 @@ void WorkerManager::handleMineralLocking()
 		if (job == WorkerData::Minerals && (
 			worker->getOrder() == BWAPI::Orders::MoveToMinerals ||
 			worker->getOrder() == BWAPI::Orders::WaitForMinerals ||
-            (worker->getOrder() == BWAPI::Orders::Move && worker->getDistance(worker->getOrderTargetPosition()) < 200)))
+            (worker->getOrder() == BWAPI::Orders::Move && InformationManager::Instance().getLocutusUnit(worker).distanceToMoveTarget() < 200)))
 		{
 			BWAPI::Unit patch = workerData.getWorkerResource(worker);
 			if (patch && worker->getOrderTarget() != patch && patch->exists())
@@ -387,14 +387,14 @@ bool WorkerManager::defendSelf(BWAPI::Unit worker, BWAPI::Unit resource)
 	if (resource && worker->getDistance(resource) < 200 && target)
 	{
 		int enemyWeaponRange = UnitUtil::GetAttackRange(target, worker);
-		bool flee =
+		bool flee = worker->isUnderAttack() &&
 			enemyWeaponRange > 0 &&          // don't flee if the target can't hurt us
 			enemyWeaponRange <= 32 &&        // no use to flee if the target has range
 			worker->getHitPoints() <= 16;    // reasonable value for the most common attackers
 			// worker->getHitPoints() <= UnitUtil::GetWeaponDamageToWorker(target);
 
 		// TODO It's not helping. Reaction time is too slow.
-		flee = false;
+		//flee = false;
 
 		if (flee)
 		{
@@ -402,7 +402,8 @@ bool WorkerManager::defendSelf(BWAPI::Unit worker, BWAPI::Unit resource)
 			BWAPI::Unit escapeMinerals = findEscapeMinerals(worker);
 			if (escapeMinerals)
 			{
-				BWAPI::Broodwar->printf("%d fleeing to %d", worker->getID(), escapeMinerals->getID());
+				//BWAPI::Broodwar->printf("%d fleeing to %d", worker->getID(), escapeMinerals->getID());
+				worker->rightClick(escapeMinerals);
 				workerData.setWorkerJob(worker, WorkerData::Minerals, escapeMinerals);
 				return true;
 			}

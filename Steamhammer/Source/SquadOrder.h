@@ -54,6 +54,11 @@ public:
         return _position;
     }
 
+	void setPosition(BWAPI::Position position)
+	{
+		_position = position;
+	}
+
     const int & getRadius() const
     {
         return _radius;
@@ -101,6 +106,11 @@ public:
 	{
 		return
 			_type == SquadOrderTypes::Attack;
+	}
+
+	bool isHarass() const {
+		return
+			_type == SquadOrderTypes::Harass;
 	}
 
 };

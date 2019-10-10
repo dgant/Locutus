@@ -17,6 +17,9 @@
 #include "MicroMedics.h"
 #include "MicroTanks.h"
 #include "MicroTransports.h"
+#include "MicroDragoon.h"
+
+#include "MicroBunkerAttackSquad.h"
 
 namespace UAlbertaBot
 {
@@ -36,6 +39,7 @@ class Squad
 	bool				_attackAtMax;       // turns true when we are at max supply
     int                 _lastRetreatSwitch;
     bool                _lastRetreatSwitchVal;
+	int					_lastRetreatScore;//最后一次撤退的分数
     size_t              _priority;
 	
 	SquadOrder          _order;
@@ -50,17 +54,15 @@ class Squad
 	MicroMedics			_microMedics;
 	MicroTanks			_microTanks;
 	MicroTransports		_microTransports;
+	MicroDragoon		_microDragoons;
 
     CombatSimulation    sim;
 
     // Sub-squads specializing in enemy bunkers
-    std::map<BWAPI::Unit, MicroBunkerAttackSquad> bunkerAttackSquads;
+    std::map<BWAPI::Position, MicroBunkerAttackSquad> bunkerAttackSquads;
 
 	std::map<BWAPI::Unit, bool>	_nearEnemy;
 
-	BWAPI::Unit		getRegroupUnit();
-	BWAPI::Unit		unitClosestToEnemy();
-    
 	void			updateUnits();
 	void			addUnitsToMicroManagers();
 	void			setNearEnemyUnits();
@@ -92,17 +94,20 @@ public:
     
 	BWAPI::Position     calcCenter() const;
 	BWAPI::Position     calcRegroupPosition();
+    BWAPI::Unit		    unitClosestToOrderPosition() const;
+    BWAPI::Unit		    unitClosestTo(BWAPI::Position position, bool debug = false) const;
 
 	const BWAPI::Unitset &  getUnits() const;
 	void                setSquadOrder(const SquadOrder & so);
 	const SquadOrder &  getSquadOrder()	const;
 
-    void                        addUnitToBunkerAttackSquad(BWAPI::Unit bunker, BWAPI::Unit unit);
+    void                        addUnitToBunkerAttackSquad(BWAPI::Position bunkerPosition, BWAPI::Unit unit);
+    bool                        addUnitToBunkerAttackSquadIfClose(BWAPI::Unit unit);
     MicroBunkerAttackSquad *    getBunkerRunBySquad(BWAPI::Unit unit);
 
 	int					getCombatSimRadius() const { return _combatSimRadius; };
 	void				setCombatSimRadius(int radius) { _combatSimRadius = radius; };
-    double              runCombatSim(BWAPI::Position center);
+    int                 runCombatSim(BWAPI::Position position);
 
 	bool				getFightVisible() const { return _fightVisibleOnly; };
 	void				setFightVisible(bool visibleOnly) { _fightVisibleOnly = visibleOnly; };
@@ -115,6 +120,6 @@ public:
 	const bool			hasCombatUnits()	const;
 	const bool			isOverlordHunterSquad() const;
 
-    bool                hasMicroManager(MicroManager* microManager) const;
+    bool                hasMicroManager(const MicroManager* microManager) const;
 };
 }

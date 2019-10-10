@@ -38,6 +38,9 @@ class StrategyManager
 {
 	StrategyManager();
 
+	BWAPI::Player _self = BWAPI::Broodwar->self();;
+	BWAPI::Player _enemy = BWAPI::Broodwar->enemy();
+
 	BWAPI::Race					    _selfRace;
 	BWAPI::Race					    _enemyRace;
     std::map<std::string, Strategy> _strategies;

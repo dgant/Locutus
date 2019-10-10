@@ -20,6 +20,8 @@ struct UnitInfo
     BWAPI::UnitType type;
     bool            completed;
 	int				estimatedCompletionFrame;
+    bool            isFlying;
+    int             groundWeaponCooldownFrame; // Frame the ground weapon will be out of cooldown
 
     UnitInfo()
         : unitID(0)
@@ -33,6 +35,8 @@ struct UnitInfo
         , type(BWAPI::UnitTypes::None)
         , completed(false)
 		, estimatedCompletionFrame(0)
+        , isFlying(false)
+        , groundWeaponCooldownFrame(0)
 	{
     }
 
@@ -48,6 +52,8 @@ struct UnitInfo
 		, type(unit->getType())
 		, completed(unit->isCompleted())
 		, estimatedCompletionFrame(ComputeCompletionFrame(unit))
+        , isFlying(unit->isFlying())
+        , groundWeaponCooldownFrame(BWAPI::Broodwar->getFrameCount() + unit->getGroundWeaponCooldown())
 	{
 	}
 

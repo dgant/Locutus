@@ -30,6 +30,7 @@ class CombatCommander
     void            updateDropSquads();
 	void            updateIdleSquad();
     void            updateKamikazeSquad();
+    void            updateDefuseSquads();
 
 	void			loadOrUnloadBunkers();
 	void			doComsatScan();
@@ -55,6 +56,7 @@ class CombatCommander
 	void			chooseReconTarget();
 	BWAPI::Position getReconLocation() const;
 	BWAPI::Position getAttackLocation(const Squad * squad);
+	BWAPI::Position getFlyAttackLocation(const Squad * squad);
 	BWAPI::Position getDropLocation(const Squad & squad);
 	BWAPI::Position	getDefenseLocation();
 
@@ -107,6 +109,8 @@ public:
 	void drawSquadInformation(int x, int y);
 
     SquadData& getSquadData() { return _squadData; };
+
+	int getNumCombatUnit() { return _combatUnits.size(); };
 
 	static CombatCommander & Instance();
 };

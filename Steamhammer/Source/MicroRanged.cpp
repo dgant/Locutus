@@ -10,6 +10,9 @@ using namespace UAlbertaBot;
 // The unit's ranged ground weapon does splash damage, so it works under dark swarm.
 // Firebats are not here: They are melee units.
 // Tanks and lurkers are not here: They have their own micro managers.
+//该单位的远程地面武器会造成溅射伤害，所以它在黑暗蜂群下工作。
+//火蝙蝠不在这里:它们是近战单位。
+//坦克和潜伏者不在这里:他们有自己的微型经理人。
 bool MicroRanged::goodUnderDarkSwarm(BWAPI::UnitType type)
 {
 	return
@@ -51,7 +54,7 @@ void MicroRanged::executeMicro(const BWAPI::Unitset & targets)
 {
 	assignTargets(targets);
 }
-
+/*
 struct CompareTiles {
 	bool operator() (const std::pair<BWAPI::TilePosition, double>& lhs, const std::pair<BWAPI::TilePosition, double>& rhs) const {
 		return lhs.second < rhs.second;
@@ -68,7 +71,7 @@ BWAPI::Position center(BWAPI::TilePosition tile)
 {
 	return BWAPI::Position(tile) + BWAPI::Position(16, 16);
 }
-
+*/
 void MicroRanged::assignTargets(const BWAPI::Unitset & targets)
 {
     const BWAPI::Unitset & rangedUnits = getUnits();
@@ -241,16 +244,16 @@ void MicroRanged::assignTargets(const BWAPI::Unitset & targets)
 				}
 
 				// attack it.
-                // Bunkers are handled by a special micro manager, unless we have a large army
-                if (rangedUnits.size() < 6 &&
-                    target->getType() == BWAPI::UnitTypes::Terran_Bunker &&
+                // Bunkers are handled by a special micro manager
+                if (target->getType() == BWAPI::UnitTypes::Terran_Bunker &&
                     target->isCompleted())
                 {
-                    squad.addUnitToBunkerAttackSquad(target, rangedUnit);
+                    squad.addUnitToBunkerAttackSquad(target->getPosition(), rangedUnit);
                 }
 				else if (Config::Micro::KiteWithRangedUnits)
 				{
-					kite(rangedUnit, target);
+					//kite(rangedUnit, target);
+					Micro::KiteTarget(rangedUnit, target);
 				}
 				else
 				{
@@ -268,12 +271,10 @@ void MicroRanged::assignTargets(const BWAPI::Unitset & targets)
                     {
                         InformationManager::Instance().getLocutusUnit(rangedUnit)
                             .moveTo(bunkerRunBySquad->getRunByPosition(rangedUnit, order.getPosition()));
-                        //Micro::Move(rangedUnit, bunkerRunBySquad->getRunByPosition(rangedUnit, order.getPosition()));
                     }
                     else
                     {
                         InformationManager::Instance().getLocutusUnit(rangedUnit).moveTo(order.getPosition(), order.getType() == SquadOrderTypes::Attack);
-                        //Micro::Move(rangedUnit, order.getPosition());
                     }
 				}
 			}
@@ -291,6 +292,7 @@ BWAPI::Unit MicroRanged::getTarget(BWAPI::Unit rangedUnit, const BWAPI::Unitset 
 	for (const auto target : targets)
 	{
 		// Skip targets under dark swarm that we can't hit.
+		//跳过我们无法命中的黄雾下的目标。
 		if (target->isUnderDarkSwarm() && !goodUnderDarkSwarm(rangedUnit->getType()))
 		{
 			continue;
@@ -306,6 +308,13 @@ BWAPI::Unit MicroRanged::getTarget(BWAPI::Unit rangedUnit, const BWAPI::Unitset 
 		{
 			continue;
 		}
+
+        // Skip targets safe behind a wall
+        if (range > UnitUtil::GetAttackRange(rangedUnit, target) &&
+            InformationManager::Instance().isBehindEnemyWall(rangedUnit, target))
+        {
+            continue;
+        }
 
 		// Let's say that 1 priority step is worth 160 pixels (5 tiles).
 		// We care about unit-target range and target-order position distance.
@@ -361,14 +370,28 @@ BWAPI::Unit MicroRanged::getTarget(BWAPI::Unit rangedUnit, const BWAPI::Unitset 
 		}
 		
 		// Prefer targets that are already hurt.
-		if (target->getType().getRace() == BWAPI::Races::Protoss && target->getShields() <= 5)
-		{
-			score += 32;
-		}
-		if (target->getHitPoints() < target->getType().maxHitPoints())
-		{
-			score += 24;
-		}
+        if (target->getType().getRace() == BWAPI::Races::Protoss && target->getShields() <= 5)
+        {
+            score += 32;
+            if (target->getHitPoints() < (target->getType().maxHitPoints() / 3))
+            {
+                score += 24;
+            }
+        }
+        else if (target->getHitPoints() < target->getType().maxHitPoints())
+        {
+            score += 24;
+            if (target->getHitPoints() < (target->getType().maxHitPoints() / 3))
+            {
+                score += 24;
+            }
+        }
+
+        // Avoid defensive matrix
+        if (target->isDefenseMatrixed())
+        {
+            score -= 4 * 32;
+        }
 
 		// Prefer to hit air units that have acid spores on them from devourers.
 		if (target->getAcidSporeCount() > 0)
@@ -405,6 +428,15 @@ BWAPI::Unit MicroRanged::getTarget(BWAPI::Unit rangedUnit, const BWAPI::Unitset 
 			}
 		}
 
+        // For wall buildings, prefer the ones with lower health
+        if (InformationManager::Instance().isEnemyWallBuilding(target) &&
+            target->getType() == BWAPI::UnitTypes::Terran_Supply_Depot)
+        {
+            score += 128;
+        }
+
+		score = getMarkTargetScore(target, score);
+
 		if (score > bestScore)
 		{
 			bestScore = score;
@@ -412,6 +444,10 @@ BWAPI::Unit MicroRanged::getTarget(BWAPI::Unit rangedUnit, const BWAPI::Unitset 
 
 			bestPriority = priority;
 		}
+	}
+
+	if (bestTarget) {
+		setMarkTargetScore(bestTarget, rangedUnit->getType());
 	}
 
 	return bestScore > 0 && !shouldIgnoreTarget(rangedUnit, bestTarget) ? bestTarget : nullptr;
@@ -573,10 +609,21 @@ int MicroRanged::getAttackPriority(BWAPI::Unit rangedUnit, BWAPI::Unit target)
 		{
 			return 11;
 		}
-        // Repairing something that can shoot makes you critical.
-        if (target->isRepairing() && target->getOrderTarget() && target->getOrderTarget()->getType().groundWeapon() != BWAPI::WeaponTypes::None)
+        // Repairing
+        if (target->isRepairing() && target->getOrderTarget())
         {
-            return 11;
+            // Something that can shoot
+            if (target->getOrderTarget()->getType().groundWeapon() != BWAPI::WeaponTypes::None)
+            {
+                return 11;
+            }
+
+            // A bunker: only target the workers if we can't outrange the bunker
+            if (target->getOrderTarget()->getType() == BWAPI::UnitTypes::Terran_Bunker &&
+                InformationManager::Instance().enemyHasInfantryRangeUpgrade())
+            {
+                return 10;
+            }
         }
         // SCVs so close to the unit that they are likely to be attacking it are important
         if (rangedUnit->getDistance(target) < 32)
@@ -692,7 +739,14 @@ void MicroRanged::kite(BWAPI::Unit rangedUnit, BWAPI::Unit target)
         return;
     }
 
-    // Compute unit ranges
+    // If the target is behind a wall, don't kite
+    if (InformationManager::Instance().isBehindEnemyWall(rangedUnit, target))
+    {
+        Micro::AttackUnit(rangedUnit, target);
+        return;
+    }
+
+    // Compute target unit range
     int targetRange(target->getType().groundWeapon().maxRange());
     if (InformationManager::Instance().enemyHasInfantryRangeUpgrade())
     {
@@ -712,6 +766,7 @@ void MicroRanged::kite(BWAPI::Unit rangedUnit, BWAPI::Unit target)
 
     // Move towards the target in the following cases:
     // - It is a sieged tank
+    // - It is repairing a sieged tank
     // - It is a building that cannot attack
     // - We are blocking a narrow choke
     // - The enemy unit is moving away from us and is close to the edge of its range, or is standing still and we aren't in its weapon range
@@ -719,6 +774,7 @@ void MicroRanged::kite(BWAPI::Unit rangedUnit, BWAPI::Unit target)
     // Do simple checks immediately
     bool moveCloser =
         target->getType() == BWAPI::UnitTypes::Terran_Siege_Tank_Siege_Mode ||
+        (target->isRepairing() && target->getOrderTarget() && target->getOrderTarget()->getType() == BWAPI::UnitTypes::Terran_Siege_Tank_Siege_Mode) ||
         (target->getType().isBuilding() && !UnitUtil::CanAttack(target, rangedUnit));
 
     // Now check enemy unit movement
@@ -734,6 +790,12 @@ void MicroRanged::kite(BWAPI::Unit rangedUnit, BWAPI::Unit target)
             if (distPredicted > distCurrent)
             {
                 kite = false;
+
+                // If the enemy is close to being out of our attack range, move closer
+                if (distToTarget > (range - 32))
+                {
+                    moveCloser = true;
+                }
             }
 
             // Enemy is standing still: move a bit closer if we outrange it
@@ -792,7 +854,7 @@ void MicroRanged::kite(BWAPI::Unit rangedUnit, BWAPI::Unit target)
     {
         if (distToTarget > 16)
         {
-            Micro::Move(rangedUnit, target->getPosition());
+            InformationManager::Instance().getLocutusUnit(rangedUnit).moveTo(target->getPosition());
         }
         else
         {

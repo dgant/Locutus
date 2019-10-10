@@ -141,11 +141,12 @@ void OpponentPlan::recognize()
 	}
 
     // When we know the enemy is not doing a fast plan, set it
-    // Will likely get overridden by an appropriate plan below later on
+    // May get overridden by a more appropriate plan below later on
     if (_openingPlan == OpeningPlan::Unknown && (
-        snap.getCount(BWAPI::UnitTypes::Zerg_Drone) > 6 || // 4- or 5-pool
-        snap.getCount(BWAPI::UnitTypes::Terran_SCV) > 8 || // BBS
-        snap.getCount(BWAPI::UnitTypes::Protoss_Probe) > 9)) // 9-gate
+        snap.getCount(BWAPI::UnitTypes::Zerg_Drone) > 6 ||     // 4- or 5-pool
+        snap.getCount(BWAPI::UnitTypes::Terran_SCV) > 8 ||     // BBS
+        snap.getCount(BWAPI::UnitTypes::Protoss_Probe) > 9) || // 9-gate
+        frame > 8000) // Failsafe if we have no other information at this point
     {
         _openingPlan = OpeningPlan::NotFastRush;
     }
@@ -153,7 +154,14 @@ void OpponentPlan::recognize()
 	// Recognize slower rushes.
 	// TODO make sure we've seen the bare geyser in the enemy base!
 	// TODO seeing a unit carrying gas also means the enemy has gas
-	if (snap.getCount(BWAPI::UnitTypes::Zerg_Hatchery) >= 2 &&
+	if (frame < 5500 &&
+        snap.getCount(BWAPI::UnitTypes::Zerg_Zergling) > 10
+        ||
+        frame > 4000 &&
+        snap.getCount(BWAPI::UnitTypes::Zerg_Hatchery) == 1 &&
+        snap.getCount(BWAPI::UnitTypes::Zerg_Drone) <= 9
+        ||
+        snap.getCount(BWAPI::UnitTypes::Zerg_Hatchery) >= 2 &&
 		snap.getCount(BWAPI::UnitTypes::Zerg_Spawning_Pool) > 0 &&
 		snap.getCount(BWAPI::UnitTypes::Zerg_Extractor) == 0 &&
         snap.getCount(BWAPI::UnitTypes::Zerg_Zergling) > 5
@@ -183,6 +191,10 @@ void OpponentPlan::recognize()
         _planIsFixed = true;
         return;
     }
+
+    // Disabling the rest, as we do no specific counters or reactions to them
+    // Better to leave it as NotFastRush so we don't confuse our opening selection
+    return;
 
 	// Recognize terran factory tech openings.
 	if (recognizeFactoryTech())

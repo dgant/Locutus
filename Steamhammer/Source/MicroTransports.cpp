@@ -148,17 +148,24 @@ void MicroTransports::loadTroops()
 }
 
 // Only called when the transport exists and is loaded.
+//只在传输存在并加载时调用。
 void MicroTransports::maybeUnloadTroops()
 {
 	// Unload if we're close to the destination, or if we're scary low on hit points.
 	// It's possible that we'll land on a cliff and the units will be stuck there.
 	const int transportHP = _transportShip->getHitPoints() + _transportShip->getShields();
-	
-	if ((transportHP < 50 || (_target.isValid() && _transportShip->getDistance(_target) < 300)) &&
+
+	if (_target.isValid() && _transportShip->getDistance(_target) < 9 * 32 &&
+		_transportShip->canUnloadAtPosition(_transportShip->getPosition())) {
+		_transportShip->unloadAll(_transportShip->getPosition());
+	}
+
+	if ((_transportShip->isUnderAttack() || transportHP < 50 || (_target.isValid() && _transportShip->getDistance(_target) < 10 * 32)) &&
 		_transportShip->canUnloadAtPosition(_transportShip->getPosition())
-        && bwebMap.usedTiles.find(BWAPI::TilePosition(_transportShip->getPosition())) == bwebMap.usedTiles.end())
+		&& bwebMap.usedTiles.find(BWAPI::TilePosition(_transportShip->getPosition())) == bwebMap.usedTiles.end())
 	{
 		// get the unit's current command
+		/*
 		BWAPI::UnitCommand currentCommand(_transportShip->getLastCommand());
 
 		// Tf we've already ordered unloading, wait.
@@ -166,9 +173,12 @@ void MicroTransports::maybeUnloadTroops()
 		{
 			return;
 		}
-
-		_transportShip->unloadAll(_transportShip->getPosition());
-	}	
+		*/
+		//_transportShip->unloadAll(_transportShip->getPosition());
+		for (auto unit : _transportShip->getLoadedUnits()){
+			_transportShip->unload(unit);
+		}
+	}
 }
 
 // Called when the transport exists and is loaded.

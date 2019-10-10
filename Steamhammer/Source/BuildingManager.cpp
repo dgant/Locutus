@@ -4,6 +4,7 @@
 #include "ProductionManager.h"
 #include "ScoutManager.h"
 #include "UnitUtil.h"
+#include "PathFinding.h"
 
 namespace { auto & bwemMap = BWEM::Map::Instance(); }
 
@@ -58,7 +59,83 @@ bool BuildingManager::buildingTimedOut(const Building & b) const
     return false;
 }
 
+//检查建筑位置
+bool BuildingManager::checkBuildingTiles(Building & b)
+{
+	if (b.builderUnit && !b.type.isRefinery() && !b.buildingUnit && !b.buildCommandGiven) {
+		//if (b.buildingUnit && b.buildingUnit->isBeingConstructed()) continue;
+		BWAPI::TilePosition position = b.desiredPosition;
+		//if (b.macroLocation == MacroLocation::Anywhere) {
+		if (b.finalPosition.isValid()) {
+			position = b.finalPosition;
+		}
+
+		//检查是否可以在当前位置创建建筑物
+		if (!BWAPI::Broodwar->canBuildHere(position, b.type, b.builderUnit)) {
+
+			//检查是否在水晶范围内
+			if (!BWAPI::Broodwar->hasPower(position, b.type) && (BWAPI::Broodwar->getUnitsInRadius(BWAPI::Position(position), 6 * 32, BWAPI::Filter::GetType == BWAPI::UnitTypes::Protoss_Pylon)).size() == 0) {
+
+			}
+
+			int top = position.x * 32; //b.type.dimensionUp();//
+			int left = position.y * 32; //b.type.dimensionLeft();//
+			int bottom = (position.x + b.type.tileWidth()) * 32;
+			int right = (position.y + b.type.tileHeight()) * 32;
+
+			BWAPI::Position topLeft(top, left);
+			BWAPI::Position bottomRight(bottom, right);
+			BWAPI::Unitset buildingUnits;// = BWAPI::Broodwar->getUnitsInRectangle(topLeft, bottomRight);
+			MapGrid::Instance().getUnits(buildingUnits, topLeft, bottomRight, true, true);
+			//MapGrid::Instance().getUnits(buildingUnits, BWAPI::Position(position), b.type.tileWidth() * 32, true, false);
+
+			for (const auto unit : buildingUnits)
+			{
+				if (unit->isFlying()) continue;
+
+				BWAPI::UnitType type = unit->getType();
+
+				if (unit->getType().isBuilding() && unit->getType() == b.type) {
+					//undoBuilding(b);
+					//cancelBuilding(b);
+					return false;
+				}
+				else if (unit->getType().isWorker() && unit != b.buildingUnit && unit->getLastCommand().getType() == BWAPI::UnitCommandTypes::Build) {
+					WorkerManager::Instance().finishedWithWorker(unit);
+					continue;
+				}
+				else {
+					if (unit->getPlayer() == BWAPI::Broodwar->enemy()) {
+						Micro::AttackUnit(b.builderUnit, unit);
+						continue;
+					}
+					else if (unit == b.builderUnit) {
+						//b.startFrame = BWAPI::Broodwar->getFrameCount();
+						continue;
+					}
+					else if (unit->canMove() && !unit->isMoving()) {
+						//Micro::Move(unit, BWAPI::Position((left - 4) * 32, (top - 4) * 32));
+						unit->rightClick(BWAPI::Position((left - 6) * 32, (top - 6) * 32));
+						continue;
+					}
+					else if (unit->isConstructing() || unit->isMoving()) {
+						continue;
+					}
+					else if (unit->getType() == BWAPI::UnitTypes::Terran_Vulture_Spider_Mine) {
+						//b.builderUnit->attack(unit);
+						Micro::AttackUnit(b.builderUnit, unit);
+						continue;
+					}
+				}
+			}
+		}
+	}
+
+	return true;
+}
+
 // STEP 1: DO BOOK KEEPING ON BUILDINGS WHICH MAY HAVE DIED OR TIMED OUT
+//第一步:对可能已经死亡或超时的建筑物做簿记
 void BuildingManager::validateWorkersAndBuildings()
 {
     std::vector<Building> toRemove;
@@ -67,6 +144,11 @@ void BuildingManager::validateWorkersAndBuildings()
     for (auto it = _buildings.begin(); it != _buildings.end(); )
     {
         auto & b = *it;
+
+		if (!checkBuildingTiles(b)) {
+			it = _buildings.erase(it);
+			return;
+		}
 
         if (buildingTimedOut(b) &&
 			ProductionManager::Instance().isOutOfBook() &&
@@ -106,6 +188,11 @@ void BuildingManager::assignWorkersToUnassignedBuildings()
             continue;
         }
 
+		if (!checkBuildingTiles(b)) {
+			cancelBuilding(b);
+			return;
+		}
+
 		// Skip protoss buildings that need pylon power if there is no space for them.
 		if (typeIsStalled(b.type))
 		{
@@ -138,6 +225,7 @@ void BuildingManager::assignWorkersToUnassignedBuildings()
 		++b.buildersSent;    // count workers ever assigned to build it
 
         // reserve this building's space
+		//保留这个建筑的空间
         BuildingPlacer::Instance().reserveTiles(b.finalPosition,b.type.tileWidth(),b.type.tileHeight());
 
         b.status = BuildingStatus::Assigned;
@@ -174,17 +262,17 @@ void BuildingManager::constructAssignedBuildings()
 		}
 		else if (!b.builderUnit->isConstructing())
         {
-            // Move towards the position if:
+            // Move towards the position if either:
             // - it hasn't been explored yet
-            // - it is in a different map area (so may require custom patching to reach)
             // - it is still far away
-            bool moveToPosition = !isBuildingPositionExplored(b) ||
-                bwemMap.GetNearestArea(b.builderUnit->getTilePosition()) != bwemMap.GetNearestArea(b.finalPosition);
+            bool moveToPosition = !isBuildingPositionExplored(b);
             if (!moveToPosition)
             {
-                int distance;
-                bwemMap.GetPath(b.builderUnit->getPosition(), BWAPI::Position(b.finalPosition), &distance);
-                moveToPosition = distance > 200;
+                int distance = PathFinding::GetGroundDistance(
+                    b.builderUnit->getPosition(), 
+                    BWAPI::Position(b.finalPosition), 
+                    PathFinding::PathFindingOptions::UseNearestBWEMArea);
+                moveToPosition = distance > 200 || (distance == -1 && b.builderUnit->getPosition().getApproxDistance(BWAPI::Position(b.finalPosition)) > 200);
             }
 
 			if (moveToPosition)
@@ -209,6 +297,19 @@ void BuildingManager::constructAssignedBuildings()
 				// Unreserve the building location. The building will mark its own location.
 				BuildingPlacer::Instance().freeTiles(b.finalPosition, b.type.tileWidth(), b.type.tileHeight());
 				Log().Debug() << "Failed to build " << b.type << " @ " << b.finalPosition << "; assume something was in the way";
+
+                // If we're trying to build a nexus against a terran opponent, assume there's a spider mine in the way
+                // We'll send a unit by to clear it
+                if (BWAPI::Broodwar->enemy()->getRace() == BWAPI::Races::Terran
+                    && b.type == BWAPI::UnitTypes::Protoss_Nexus)
+                {
+                    auto base = InformationManager::Instance().baseAt(b.finalPosition);
+                    if (base)
+                    {
+                        Log().Debug() << "Detected spider mine blocking base @ " << b.finalPosition;
+                        base->spiderMined = true;
+                    }
+                }
 			}
             else
             {
@@ -828,12 +929,6 @@ BWAPI::TilePosition BuildingManager::getBuildingLocation(const Building & b)
 // Undo any connections with other data structures, then delete.
 void BuildingManager::undoBuilding(Building& b)
 {
-	// If the building was to establish a base, unreserve the base location.
-	if (b.type.isResourceDepot() && b.macroLocation != MacroLocation::Macro && b.finalPosition.isValid())
-	{
-		InformationManager::Instance().unreserveBase(b.finalPosition);
-	}
-
     // Free reserved tiles
     if (b.finalPosition.isValid())
     {

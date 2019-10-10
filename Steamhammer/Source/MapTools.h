@@ -11,14 +11,24 @@
 namespace UAlbertaBot
 {
 
-struct MineralWalkChoke
+struct ChokeData
 {
+    int width;
+
+    bool isRamp;
+    BWAPI::TilePosition highElevationTile;
+
+    bool requiresMineralWalk;
     BWAPI::Unit firstMineralPatch;
     BWAPI::Unit secondMineralPatch;
 
-    MineralWalkChoke(BWAPI::Unit _firstMineralPatch, BWAPI::Unit _secondMineralPatch) 
-        : firstMineralPatch(_firstMineralPatch)
-        , secondMineralPatch(_secondMineralPatch)
+    ChokeData(const BWEM::ChokePoint* choke)
+        : width(0)
+        , isRamp(false)
+        , highElevationTile(BWAPI::TilePosition(choke->Center()))
+        , requiresMineralWalk(false)
+        , firstMineralPatch(nullptr)
+        , secondMineralPatch(nullptr)
     {};
 };
 
@@ -68,7 +78,12 @@ public:
 	void	drawHomeDistanceMap();
 
 	BWAPI::TilePosition	getNextExpansion(bool hidden, bool wantMinerals, bool wantGas);
-	BWAPI::TilePosition	reserveNextExpansion(bool hidden, bool wantMinerals, bool wantGas);
+
+	BWAPI::Position     getDistancePosition(BWAPI::Position start, BWAPI::Position end, double dist);
+	BWAPI::Position     getExtendedPosition(BWAPI::Position start, BWAPI::Position end, double dist);
+
+	// center---圆心坐标， radius---圆半径， sp---圆外一点， rp1,rp2---切点坐标   
+	void				getCutPoint(BWAPI::Position center, double radius, BWAPI::Position sp, BWAPI::Position & rp1, BWAPI::Position & rp2);
 
 	bool	hasIslandBases() const { return _hasIslandBases; };
 };

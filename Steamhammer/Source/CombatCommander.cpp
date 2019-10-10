@@ -1,11 +1,10 @@
-#include <queue>
-
 #include "CombatCommander.h"
 
 #include "Bases.h"
 #include "OpponentModel.h"
 #include "Random.h"
 #include "UnitUtil.h"
+#include "PathFinding.h"
 
 using namespace UAlbertaBot;
 
@@ -55,8 +54,11 @@ void CombatCommander::initializeSquads()
 	// The flying squad separates air units so they can act independently.
 	_squadData.addSquad(Squad("Flying", mainAttackOrder, AttackPriority));
 
-    // The kamikaze squad is an attack squad that (almost) never retreats
-    // We put zealots in here that can no longer fight efficiently, for example if the enemy has air or ranged units
+    // The kamikaze squad is an attack squad that never retreats
+    // We might put units here in the following situations:
+    // - We have zealots that can no longer fight efficiently, for example if the enemy has air or ranged units
+    // - The units have done a bunker run-by, so we don't want them to retreat
+    // - The squad wants to retreat but these units are caught behind enemy lines
     _squadData.addSquad(Squad("Kamikaze", mainAttackOrder, KamikazePriority));
 
 	// The recon squad carries out reconnaissance in force to deny enemy bases.
@@ -107,6 +109,7 @@ void CombatCommander::update(const BWAPI::Unitset & combatUnits)
 		updateScoutDefenseSquad();
 		updateBaseDefenseSquads();
 		updateHarassSquads();
+        updateDefuseSquads();
 		updateReconSquad();
 		updateAttackSquads();
 	}
@@ -171,11 +174,35 @@ void CombatCommander::updateKamikazeSquad()
             if (unit.second.type == BWAPI::UnitTypes::Protoss_Dragoon)
                 enemyDragoons++;
 
-        if (enemyDragoons < 3) return;
+        // If we are rushing, add zealots to the kamikaze squad when they get close to the order position if
+        // the enemy has 2 or more dragoons
+        if (StrategyManager::Instance().isRushing() && enemyDragoons > 2)
+        {
+            std::vector<BWAPI::Unit> unitsToMove;
+            for (auto & unit : groundSquad.getUnits())
+                if (_squadData.canAssignUnitToSquad(unit, kamikazeSquad) &&
+                    unit->getDistance(groundSquad.getSquadOrder().getPosition()) < 7 * 32)
+                {
+                    unitsToMove.push_back(unit);
+                }
+
+            for (auto & unit : unitsToMove)
+                _squadData.assignUnitToSquad(unit, kamikazeSquad);
+        }
+
+        if (enemyDragoons < 2) return;
 
         // Make sure we have at least as many zealots as the enemy has goons
-        if (groundSquad.getUnits().size() < enemyDragoons) return;
-    }
+		//确保我们至少有和敌人暴徒一样多的狂热分子
+		if (groundSquad.getUnits().size() < enemyDragoons) {
+			//_goAggressive = false;
+			return;
+		}
+
+		if (BWAPI::Broodwar->getFrameCount() > 6 * 60 * 24 && groundSquad.getUnits().size() < enemyDragoons * 1.5) {
+			return;
+		}
+	}
     else
         return;
 
@@ -191,10 +218,70 @@ void CombatCommander::updateKamikazeSquad()
     Log().Get() << "Sent " << unitsToMove.size() << " units on a kamikaze attack";
 }
 
+void CombatCommander::updateDefuseSquads()
+{
+    if (BWAPI::Broodwar->enemy()->getRace() != BWAPI::Races::Terran) return;
+
+    // Loop all of the bases
+    for (auto base : BWTA::getBaseLocations())
+    {
+        std::stringstream squadName;
+        squadName << "Defuse " << base->getPosition().x << " " << base->getPosition().y;
+
+        // If the base is currently marked as spider-mined, make sure there is a squad defusing it
+        if (InformationManager::Instance().getBase(base)->spiderMined)
+        {
+            if (!_squadData.squadExists(squadName.str()))
+            {
+                _squadData.addSquad(Squad(
+                    squadName.str(),
+                    SquadOrder(SquadOrderTypes::KamikazeAttack, base->getPosition(), 64, "Defuse expansion"),
+                    ReconPriority));
+            }
+
+            Squad & squad = _squadData.getSquad(squadName.str());
+            if (squad.getUnits().empty() && !onTheDefensive())
+            {
+                // Send the nearest zealot that can be reassigned from its current duties
+                BWAPI::Unit bestUnit = nullptr;
+                int bestDist = INT_MAX;
+                for (auto & unit : BWAPI::Broodwar->self()->getUnits())
+                {
+                    if (unit->getType() != BWAPI::UnitTypes::Protoss_Zealot) continue;
+                    if (!_squadData.canAssignUnitToSquad(unit, squad)) continue;
+
+                    int dist = PathFinding::GetGroundDistance(unit->getPosition(), base->getPosition());
+                    if (dist > -1 && dist < bestDist)
+                    {
+                        bestDist = dist;
+                        bestUnit = unit;
+                    }
+                }
+
+                if (bestUnit)
+                {
+                    _squadData.assignUnitToSquad(bestUnit, squad);
+                }
+            }
+        }
+
+        // Otherwise, make sure there isn't a squad defusing it
+        else
+        {
+            if (_squadData.squadExists(squadName.str()))
+            {
+                _squadData.removeSquad(squadName.str());
+            }
+        }
+    }
+}
+
 // Update the base harassment squads
 // Currently we put all dark templar that aren't being used for drops or base defense in here
 void CombatCommander::updateHarassSquads()
 {
+    if (BWAPI::Broodwar->enemy()->getRace() != BWAPI::Races::Protoss) return;
+
     // Collect active squads with the base they are harassing
     auto enemyBases = InformationManager::Instance().getEnemyBases();
     std::vector<std::pair<Squad*, BWTA::BaseLocation*>> activeSquads;
@@ -262,7 +349,7 @@ void CombatCommander::updateHarassSquads()
         if (unit->getType() != BWAPI::UnitTypes::Protoss_Dark_Templar) continue;
 
         // Advance the iterator to a squad that needs more units
-        while (it != activeSquads.end() && it->first->getUnits().size() >= 2) it++;
+        while (it != activeSquads.end() && it->first->getUnits().size() >= 4) it++;
         if (it == activeSquads.end()) break;
 
         // Try to add the unit to the squad
@@ -289,14 +376,32 @@ void CombatCommander::updateReconSquad()
 		return;
 	}
 
-    // To avoid weakening our initial push, don't scout immediately.
-    // We start scouting Zerg opponents at frame 12000, others at 15000.
-    if (BWAPI::Broodwar->getFrameCount() <
-        (BWAPI::Broodwar->enemy()->getRace() == BWAPI::Races::Zerg ? 12000 : 15000))
+    // Don't scout terrans or protoss until frame 15000
+    // They do not tend to expand beyond their natural before then
+    if (BWAPI::Broodwar->enemy()->getRace() != BWAPI::Races::Zerg &&
+        BWAPI::Broodwar->getFrameCount() <  15000)
     {
         reconSquad.clear();
         return;
     }
+
+	// What is available to put into the squad?
+	int availableWeight = 0;
+	int availableDetectors = 0;
+	for (const auto unit : _combatUnits)
+	{
+		availableWeight += weighReconUnit(unit);
+		if (unit->getType().isDetector())  {
+			availableDetectors++;
+			if (availableDetectors > 1) {
+				reconSquad.clear();
+				if (_squadData.canAssignUnitToSquad(unit, reconSquad)) {
+					_squadData.assignUnitToSquad(unit, reconSquad);
+					break;
+				}
+			}
+		}
+	}
 
 	chooseReconTarget();
 
@@ -329,15 +434,6 @@ void CombatCommander::updateReconSquad()
 	if (squadWeight == 0 && !reconSquad.isEmpty())
 	{
 		reconSquad.clear();
-	}
-
-	// What is available to put into the squad?
-	int availableWeight = 0;
-	int availableDetectors = 0;
-	for (const auto unit : _combatUnits)
-	{
-		availableWeight += weighReconUnit(unit);
-		if (unit->getType().isDetector()) availableDetectors++;
 	}
 
 	// The allowed weight of the recon squad. It should steal few units.
@@ -439,6 +535,7 @@ int CombatCommander::weighReconUnit(const BWAPI::UnitType type) const
 	if (type == BWAPI::UnitTypes::Protoss_Zealot) return 4;
 	if (type == BWAPI::UnitTypes::Protoss_Dragoon) return 4;
 	if (type == BWAPI::UnitTypes::Protoss_Dark_Templar) return 4;
+	if (type == BWAPI::UnitTypes::Protoss_Observer) return 8;
 
 	return 0;
 }
@@ -507,6 +604,24 @@ BWAPI::Position CombatCommander::getReconLocation() const
 	BWAPI::Position mainPosition = InformationManager::Instance().getMyMainBaseLocation()->getPosition();
     auto enemyBases = InformationManager::Instance().getEnemyBases();
 
+    // Gather up all of the BWEM areas that our main attack squad will traverse on the way to its current order position
+    std::set<const BWEM::Area *> attackSquadAreas;
+    const Squad & groundSquad = _squadData.getSquad("Ground");
+    if (!groundSquad.isEmpty())
+    {
+        BWAPI::Unit vanguard = groundSquad.unitClosestToOrderPosition();
+        const BWEM::Area * vanguardArea = vanguard ? bwemMap.GetArea(BWAPI::WalkPosition(vanguard->getPosition())) : nullptr;
+        if (vanguardArea)
+        {
+            attackSquadAreas.insert(vanguardArea);
+            for (auto choke : PathFinding::GetChokePointPath(vanguard->getPosition(), groundSquad.getSquadOrder().getPosition()))
+            {
+                attackSquadAreas.insert(choke->GetAreas().first);
+                attackSquadAreas.insert(choke->GetAreas().second);
+            }
+        }
+    }
+
     // Score based on two factors: proximity to any known enemy base and time since we've last scouted it
     BWTA::BaseLocation * bestBase = nullptr;
     double bestScore = 0.0;
@@ -514,6 +629,10 @@ BWAPI::Position CombatCommander::getReconLocation() const
 	{
         if (InformationManager::Instance().getBaseOwner(base) != BWAPI::Broodwar->neutral()) continue; // not neutral
         if (MapTools::Instance().getGroundTileDistance(base->getPosition(), mainPosition) == -1) continue; // not reachable by ground
+
+        // already on route being taken by the ground squad
+        auto area = bwemMap.GetArea(base->getTilePosition());
+        if (attackSquadAreas.find(area) != attackSquadAreas.end()) continue;
 
         int proximityToEnemyBase = MapTools::Instance().closestBaseDistance(base, enemyBases);
         double proximityFactor = proximityToEnemyBase > 0 ? proximityToEnemyBase : 1.0;
@@ -625,9 +744,6 @@ void CombatCommander::updateAttackSquads()
 	{
 		SquadOrder mainAttackOrder(SquadOrderTypes::Attack, getAttackLocation(&groundSquad), AttackRadius, "Attack enemy base");
 		groundSquad.setSquadOrder(mainAttackOrder);
-
-		SquadOrder flyingAttackOrder(SquadOrderTypes::Attack, getAttackLocation(&flyingSquad), AttackRadius, "Attack enemy base");
-		flyingSquad.setSquadOrder(flyingAttackOrder);
 	}
 	else
 	{
@@ -669,7 +785,7 @@ void CombatCommander::updateAttackSquads()
                         mainChokes++;
 
                 if (mainChokes == 1 && 
-                    groundSquad.runCombatSim(BWAPI::Position(bwebMap.mainChoke->Center())) > 0)
+                    groundSquad.runCombatSim(BWAPI::Position(bwebMap.mainChoke->Center())) >= 0)
                 {
                     defendPosition = BWAPI::Position(bwebMap.mainChoke->Center());
                 }
@@ -679,9 +795,15 @@ void CombatCommander::updateAttackSquads()
 		SquadOrder mainDefendOrder(wall.exists() ? SquadOrderTypes::HoldWall : SquadOrderTypes::Hold, defendPosition, radius, "Hold the wall");
 		groundSquad.setSquadOrder(mainDefendOrder);
 
+		/*
 		SquadOrder flyingDefendOrder(SquadOrderTypes::Hold, defendPosition, radius, "Hold the wall");
 		flyingSquad.setSquadOrder(flyingDefendOrder);
+		*/
 	}
+
+	SquadOrder flyingAttackOrder(SquadOrderTypes::Attack, getFlyAttackLocation(&flyingSquad), AttackRadius, "Attack enemy base");
+	flyingSquad.setSquadOrder(flyingAttackOrder);
+
 }
 
 // Unit definitely belongs in the Flying squad.
@@ -837,22 +959,23 @@ void CombatCommander::updateScoutDefenseSquad()
     // Chase the scout unless there is an enemy unit in the region that isn't a scout
     bool hasScout = false;
     bool hasNonScout = true;
-    for (const auto unit : BWAPI::Broodwar->enemy()->getUnits())
+    for (const auto & ui : InformationManager::Instance().getUnitInfo(BWAPI::Broodwar->enemy()))
     {
-        if (BWTA::getRegion(BWAPI::TilePosition(unit->getPosition())) == myRegion)
+        // Was the unit last seen in our main region?
+        if (!ui.second.lastPosition.isValid()) continue;
+        if (BWTA::getRegion(BWAPI::TilePosition(ui.second.lastPosition)) != myRegion) continue;
+
+        // Is this a scout?
+        // Workers are not considered scouts if one has attacked recently
+        if (ui.second.type == BWAPI::UnitTypes::Zerg_Overlord ||
+            (ui.second.type.isWorker() && _enemyWorkerAttackedAt < (BWAPI::Broodwar->getFrameCount() - 120)))
         {
-            // Is this a scout?
-            // Workers are not considered scouts if one has attacked recently
-            if (unit->getType() == BWAPI::UnitTypes::Zerg_Overlord ||
-                (unit->getType().isWorker() && _enemyWorkerAttackedAt < (BWAPI::Broodwar->getFrameCount() - 120)))
-            {
-                hasScout = true;
-            }
-            else
-            {
-                hasNonScout = true;
-                break;
-            }
+            hasScout = true;
+        }
+        else
+        {
+            hasNonScout = true;
+            break;
         }
     }
 
@@ -953,17 +1076,18 @@ void CombatCommander::updateBaseDefenseSquads()
         {
             // If it's a harmless air unit, don't worry about it for base defense.
             // TODO something more sensible
+			/*
             if (unit->getType() == BWAPI::UnitTypes::Zerg_Overlord ||
                 unit->getType() == BWAPI::UnitTypes::Protoss_Observer ||
                 unit->isLifted())  // floating terran building
             {
                 continue;
             }
-
+			*/
             // If the enemy unit is not in the region and not close to the wall, ignore it
             if (BWTA::getRegion(BWAPI::TilePosition(unit->getPosition())) != myRegion &&
                 (myRegion != naturalRegion || !wall.exists() ||
-                    unit->getDistance(BuildingPlacer::Instance().getWall().gapCenter) > 320))
+                    unit->getDistance(BuildingPlacer::Instance().getWall().gapCenter) > 10 * 32))
             {
                 continue;
             }
@@ -973,7 +1097,7 @@ void CombatCommander::updateBaseDefenseSquads()
 
             // Add any units close to it
             for (const auto closeUnit : BWAPI::Broodwar->enemy()->getUnits())
-                if (unit != closeUnit && unit->getDistance(closeUnit) < 200)
+                if (unit != closeUnit && unit->getDistance(closeUnit) < 400)
                     enemyUnits.insert(closeUnit);
         }
 
@@ -1099,7 +1223,7 @@ void CombatCommander::updateBaseDefenseSquads()
             int rushDistance = INT_MAX;
             if (enemyBaseLocation)
             {
-                bwemMap.GetPath(wall.gapCenter, enemyBaseLocation->getPosition(), &rushDistance);
+                rushDistance = PathFinding::GetGroundDistance(wall.gapCenter, enemyBaseLocation->getPosition(), PathFinding::PathFindingOptions::UseNearestBWEMArea);
             }
             else
             {
@@ -1107,8 +1231,7 @@ void CombatCommander::updateBaseDefenseSquads()
                 {
                     if (base == mainBaseLocation) continue;
 
-                    int baseDistance;
-                    bwemMap.GetPath(wall.gapCenter, base->getPosition(), &baseDistance);
+                    int baseDistance = PathFinding::GetGroundDistance(wall.gapCenter, base->getPosition(), PathFinding::PathFindingOptions::UseNearestBWEMArea);
                     if (baseDistance < rushDistance)
                         rushDistance = baseDistance;
                 }
@@ -1118,8 +1241,7 @@ void CombatCommander::updateBaseDefenseSquads()
             int zerglingArrivalFrame = 2600 + rushDistance / BWAPI::UnitTypes::Zerg_Zergling.topSpeed();
 
             // Now subtract the approximate number of frames it will take our workers to get to the wall
-            int wallDistance;
-            bwemMap.GetPath(wall.gapCenter, mainBaseLocation->getPosition(), &wallDistance);
+            int wallDistance = PathFinding::GetGroundDistance(wall.gapCenter, mainBaseLocation->getPosition(), PathFinding::PathFindingOptions::UseNearestBWEMArea);
             int workerMovementFrames = 1.3 * wallDistance / BWAPI::UnitTypes::Protoss_Probe.topSpeed();
 
             Log().Debug() << "Active wall cannons: " << activeWallCannons << "; rush distance: " << rushDistance << "; arrival frame: " << zerglingArrivalFrame << "; worker frames: " << workerMovementFrames;
@@ -1141,9 +1263,7 @@ void CombatCommander::updateBaseDefenseSquads()
         // - there is nothing to defend against
         // - we are up against overwhelming odds and the base isn't worth defending
         if ((groundDefendersNeeded == 0 && flyingDefendersNeeded == 0) ||
-            (groundDefendersNeeded > 50 &&
-            (BWAPI::Broodwar->getFrameCount() > 14000 ||
-                (myRegion != mainRegion && myRegion != naturalRegion))))
+            (groundDefendersNeeded > 50 && myRegion != mainRegion && myRegion != naturalRegion))
         {
             // if a defense squad for this region exists, empty it
             if (_squadData.squadExists(squadName.str()))
@@ -1216,8 +1336,8 @@ void CombatCommander::updateBaseDefenseSquads()
         }
 
         // Set the squad order
-
         // If we are defending our natural and we have a wall with cannons, use a special order
+		//如果我们是在保卫自己的自然，我们有一堵墙，大炮，使用一个特殊的命令
         if (myRegion == naturalRegion && activeWallCannons > 0)
         {
             _squadData.getSquad(squadName.str()).setSquadOrder(SquadOrder(
@@ -1482,26 +1602,35 @@ void CombatCommander::cancelDyingItems()
 {
 	for (const auto unit : BWAPI::Broodwar->self()->getUnits())
 	{
-        if (!unit->isUnderAttack()) continue;
-        if (!unit->getType().isBuilding()) continue;
-        if (unit->isCompleted()) continue;
-        if (!unit->canCancelConstruction()) continue;
-        if ((unit->getShields() + unit->getHitPoints()) >= 20) continue;
+		if (!unit->isUnderAttack()) continue;
+		if (!unit->getType().isBuilding()) continue;
+		if ((unit->getShields() + unit->getHitPoints()) >= 20) continue;
 
-        // Don't cancel buildings being attacked by a single worker
-        int workersAttacking = 0;
-        bool nonWorkersAttacking = false;
-        for (const auto enemyUnit : BWAPI::Broodwar->enemy()->getUnits())
-            if (enemyUnit->getOrderTarget() == unit)
-            {
-                if (enemyUnit->getType().isWorker()) workersAttacking++;
-                else nonWorkersAttacking = true;
-            }
-        if (workersAttacking <= 1 && !nonWorkersAttacking) continue;
+		// Don't cancel buildings being attacked by a single worker
+		int workersAttacking = 0;
+		bool nonWorkersAttacking = false;
+		for (const auto enemyUnit : BWAPI::Broodwar->enemy()->getUnits())
+			if (enemyUnit->getOrderTarget() == unit)
+			{
+				if (enemyUnit->getType().isWorker()) workersAttacking++;
+				else nonWorkersAttacking = true;
+			}
+		if (workersAttacking <= 1 && !nonWorkersAttacking) continue;
 
-        Log().Get() << "Cancelling dying " << unit->getType() << " @ " << unit->getTilePosition();
-        BuildingPlacer::Instance().freeTiles(unit->getTilePosition(), unit->getType().width(), unit->getType().height());
-		unit->cancelConstruction();
+		if (unit->isCompleted()) {
+			if (unit->canCancelTrain()) unit->cancelTrain();
+			if (unit->canCancelUpgrade()) unit->cancelUpgrade();
+			if (unit->canCancelResearch()) unit->cancelResearch();
+		}
+		else {
+
+			if (unit->getType() == BWAPI::UnitTypes::Protoss_Photon_Cannon && BWAPI::Broodwar->getFrameCount() < 3 * 60 * 24) continue;
+
+			if (!unit->canCancelConstruction()) continue;
+			Log().Get() << "Cancelling dying " << unit->getType() << " @ " << unit->getTilePosition();
+			BuildingPlacer::Instance().freeTiles(unit->getTilePosition(), unit->getType().width(), unit->getType().height());
+			unit->cancelConstruction();
+		}
 	}
 }
 
@@ -1530,7 +1659,7 @@ void CombatCommander::pullWorkers(int n)
 		return workerPullScore(left) < workerPullScore(right);
 	};
 
-	std::priority_queue<BWAPI::Unit, std::vector<BWAPI::Unit>, decltype(compare)> workers;
+	std::priority_queue<BWAPI::Unit, std::vector<BWAPI::Unit>, decltype(compare)> workers(compare);
 
 	Squad & groundSquad = _squadData.getSquad("Ground");
 
@@ -1564,8 +1693,9 @@ void CombatCommander::releaseWorkers()
 
 void CombatCommander::finishedRushing()
 {
-    // Against zerg we don't have to do anything special, we can continue with zealots
-    if (BWAPI::Broodwar->enemy()->getRace() == BWAPI::Races::Zerg) return;
+    // Only move zealots to the kamikaze squad vs. protoss
+    // Against other races the zealots can still be useful
+    if (BWAPI::Broodwar->enemy()->getRace() != BWAPI::Races::Protoss) return;
 
     // When we are finished rushing, all units from the ground squad go into the kamikaze squad
     Squad & groundSquad = _squadData.getSquad("Ground");
@@ -1595,21 +1725,23 @@ bool CombatCommander::onTheDefensive()
         : InformationManager::Instance().getMyMainBaseLocation();
 
     // First check: Our ground or air squads are fighting a good distance away from the base
-    auto& groundSquad = CombatCommander::Instance().getSquadData().getSquad("Ground");
-    if (groundSquad.hasCombatUnits())
+    Squad & groundSquad = _squadData.getSquad("Ground");
+    BWAPI::Unit groundVanguard = groundSquad.unitClosestToOrderPosition();
+    if (groundVanguard)
     {
-        int distanceFromNatural;
-        bwemMap.GetPath(groundSquad.calcCenter(), base->getPosition(), &distanceFromNatural);
+        int distanceFromNatural = PathFinding::GetGroundDistance(groundVanguard->getPosition(), base->getPosition());
         if (distanceFromNatural > 1500) return false;
     }
 
-    auto& flyingSquad = CombatCommander::Instance().getSquadData().getSquad("Flying");
-    if (flyingSquad.hasCombatUnits() && flyingSquad.calcCenter().getApproxDistance(base->getPosition()) > 1500)
+    BWAPI::Unit flyingVanguard = _squadData.getSquad("Flying").unitClosestToOrderPosition();
+    if (flyingVanguard && flyingVanguard->getDistance(base->getPosition()) > 1500)
         return false;
 
-    // Our squads are empty or close to home. We're on the defensive if an enemy unit is close to our base
+    // Our squads are empty or close to home. We're on the defensive if an enemy combat unit is close to our base
     for (auto & ui : InformationManager::Instance().getUnitInfo(BWAPI::Broodwar->enemy()))
-        if (ui.second.lastPosition.getApproxDistance(base->getPosition()) < 1500)
+        if (UnitUtil::IsCombatUnit(ui.second.type) &&
+            !ui.second.goneFromLastPosition &&
+            ui.second.lastPosition.getApproxDistance(base->getPosition()) < 1500)
             return true;
 
     return false;
@@ -1623,18 +1755,6 @@ void CombatCommander::drawSquadInformation(int x, int y)
 // Choose a point of attack for the given squad (which may be null).
 BWAPI::Position CombatCommander::getAttackLocation(const Squad * squad)
 {
-/*
-Handled earlier in Locutus
-
-	// 0. If we're defensive, look for a front line to hold. No attacks.
-	if (!_goAggressive)
-	{
-		return getDefenseLocation();
-	}
-*/
-
-	// Otherwise we are aggressive. Look for a spot to attack.
-
 	// Ground and air considerations.
 	bool hasGround = true;
 	bool hasAir = false;
@@ -1650,7 +1770,7 @@ Handled earlier in Locutus
 
 	// 1. Attack an enemy base
 	// Only if the squad can attack ground. Lift the command center and it is no longer counted as a base.
-	if (canAttackGround)
+	if (canAttackGround || !hasAir)
 	{
         // Weight this by:
         // - How much static defense is at the base
@@ -1689,11 +1809,17 @@ Handled earlier in Locutus
                 double defenseFactor = defenseCount == 0 ? 1.0 : 1.0 / (1.0 + defenseCount);
 
                 // Importance of the base scales linearly with time, we don't care when it is 10 minutes old
-                int age = BWAPI::Broodwar->getFrameCount() - InformationManager::Instance().getBaseOwnedSince(base);
-                double ageFactor = std::max(0.0, 10000.0 - age) / 10000.0;
+                // An exception is the enemy main, which we do not age until after frame 10000
+                double ageFactor = 1.0;
+                if (BWAPI::Broodwar->getFrameCount() > 10000 ||
+                    base != InformationManager::Instance().getEnemyMainBaseLocation())
+                {
+                    int age = BWAPI::Broodwar->getFrameCount() - InformationManager::Instance().getBaseOwnedSince(base);
+                    ageFactor = std::max(0.0, 14400.0 - age) / 14400.0;
+                }
 
                 double score = ageFactor * defenseFactor;
-				if (score > bestScore)
+				if (score > bestScore || !targetBase)
 				{
 					targetBase = base;
 					bestScore = score;
@@ -1716,15 +1842,27 @@ Handled earlier in Locutus
 		}
 	}
 
+    // 1b. If we haven't found the enemy start location yet, pick an unexplored start location
+    if (!InformationManager::Instance().getEnemyMainBaseLocation())
+    {
+        for (BWTA::BaseLocation * startLocation : BWTA::getStartLocations())
+        {
+            if (!BWAPI::Broodwar->isExplored(startLocation->getTilePosition()))
+            {
+                return startLocation->getPosition();
+            }
+        }
+    }
+
 	// 2. Attack known enemy buildings.
 	// We assume that a terran can lift the buildings; otherwise, the squad must be able to attack ground.
-	if (canAttackGround || BWAPI::Broodwar->enemy()->getRace() == BWAPI::Races::Terran)
+	if (canAttackGround || BWAPI::Broodwar->enemy()->getRace() != BWAPI::Races::Zerg)
 	{
 		for (const auto & kv : InformationManager::Instance().getUnitInfo(BWAPI::Broodwar->enemy()))
 		{
 			const UnitInfo & ui = kv.second;
 
-			if (ui.type.isBuilding() && ui.lastPosition.isValid() && !ui.goneFromLastPosition)
+			if (ui.type.isBuilding() && ui.lastPosition.isValid() && !ui.goneFromLastPosition && bwemMap.GetArea(BWAPI::WalkPosition(ui.lastPosition)))
 			{
 				return ui.lastPosition;
 			}
@@ -1761,13 +1899,12 @@ Handled earlier in Locutus
             if (InformationManager::Instance().getBaseOwner(base) != BWAPI::Broodwar->neutral()) continue;
 
             // If there is no path to the base, continue
-            int dist;
-            auto path = bwemMap.GetPath(squadCenter, base->getPosition(), &dist);
-            if (dist == -1) continue;
+            auto path = PathFinding::GetChokePointPath(squadCenter, base->getPosition());
+            if (path.empty()) continue;
 
-            // A choke requires mineral walking if we have put something in Ext
+            // Skip bases behind chokes that require mineral walking
             for (auto choke : path)
-                if (choke->Ext())
+                if (((ChokeData*)choke->Ext())->requiresMineralWalk)
                     goto nextBase;
 
             return base->getPosition();
@@ -1777,6 +1914,205 @@ Handled earlier in Locutus
     }
 
 	// 4. We can't see anything, so explore the map until we find something.
+	return MapGrid::Instance().getLeastExplored(hasGround && !hasAir);
+}
+
+// Choose a point of attack for the given squad (which may be null).
+//为指定的小队选择一个攻击点(可能为空)。
+BWAPI::Position CombatCommander::getFlyAttackLocation(const Squad * squad)
+{
+	int distance = 0;
+	BWAPI::Position myMainPosition = InformationManager::Instance().getMyMainBaseLocation()->getPosition();
+	BWAPI::Position mainAttackPosition;
+
+	if (InformationManager::Instance().getEnemyMainBaseLocation()) {
+		mainAttackPosition = InformationManager::Instance().getEnemyMainBaseLocation()->getPosition();
+		distance = myMainPosition.getDistance(mainAttackPosition);
+	}
+
+	if (InformationManager::Instance().getEnemyNaturalLocation()) {
+
+		if (distance > myMainPosition.getDistance(InformationManager::Instance().getEnemyNaturalLocation()->getPosition())) {
+			mainAttackPosition = InformationManager::Instance().getEnemyNaturalLocation()->getPosition();
+		}
+	}
+
+	return mainAttackPosition;
+
+	// Ground and air considerations.
+	bool hasGround = true;
+	bool hasAir = false;
+	bool canAttackAir = false;
+	bool canAttackGround = true;
+	if (squad)
+	{
+		hasGround = squad->hasGround();
+		hasAir = squad->hasAir();
+		canAttackAir = squad->canAttackAir();
+		canAttackGround = squad->canAttackGround();
+	}
+
+	// 1. Attack an enemy base
+	// Only if the squad can attack ground. Lift the command center and it is no longer counted as a base.
+	// 1.攻击敌人基地
+	// 只要小队能攻击地面。举起指挥中心，它就不再是基地。
+	if (canAttackGround || !hasAir)
+	{
+		// Weight this by:
+		// - How much static defense is at the base
+		// - How long the base has been active (longer -> less important as there will be fewer minerals available)
+
+		BWTA::BaseLocation * targetBase = nullptr;
+		double bestScore = 0.0;
+		for (BWTA::BaseLocation * base : BWTA::getBaseLocations())
+		{
+			if (InformationManager::Instance().getBaseOwner(base) == BWAPI::Broodwar->enemy())
+			{
+				// Count defenses
+				int defenseCount = 0;
+				std::vector<UnitInfo> enemies;
+				InformationManager::Instance().getNearbyForce(enemies, base->getPosition(), BWAPI::Broodwar->enemy(), 16 * 32);
+				for (const auto & enemy : enemies)
+				{
+					// Count enemies that are buildings or slow-moving units good for defense.
+					//计算对防御有利的建筑或缓慢移动单位的敌人。
+					if (enemy.type.isBuilding() ||
+						enemy.type == BWAPI::UnitTypes::Terran_Missile_Turret ||
+						enemy.type == BWAPI::UnitTypes::Terran_Goliath ||
+						enemy.type == BWAPI::UnitTypes::Protoss_Photon_Cannon ||
+						enemy.type == BWAPI::UnitTypes::Protoss_Dragoon ||
+						enemy.type == BWAPI::UnitTypes::Zerg_Spore_Colony ||
+						enemy.type == BWAPI::UnitTypes::Zerg_Hydralisk)
+					{
+						// If the unit could attack (some units of) the squad, count it.
+						if (hasGround && UnitUtil::TypeCanAttackGround(enemy.type) ||			// doesn't recognize casters
+							hasAir && UnitUtil::TypeCanAttackAir(enemy.type) ||					// doesn't recognize casters
+							enemy.type == enemy.type == BWAPI::UnitTypes::Protoss_High_Templar)	// spellcaster
+						{
+							defenseCount++;
+						}
+					}
+				}
+
+				double defenseFactor = defenseCount == 0 ? 1.0 : 1.0 / (1.0 + defenseCount);
+
+				// Importance of the base scales linearly with time, we don't care when it is 10 minutes old
+				// An exception is the enemy main, which we do not age until after frame 10000
+				double ageFactor = 1.0;
+				if (BWAPI::Broodwar->getFrameCount() > 10000 ||
+					base != InformationManager::Instance().getEnemyMainBaseLocation())
+				{
+					int age = BWAPI::Broodwar->getFrameCount() - InformationManager::Instance().getBaseOwnedSince(base);
+					ageFactor = std::max(0.0, 14400.0 - age) / 14400.0;
+				}
+
+				double score = ageFactor * defenseFactor;
+				if (score > bestScore || !targetBase)
+				{
+					targetBase = base;
+					bestScore = score;
+				}
+			}
+		}
+
+		if (targetBase)
+		{
+			// TODO debugging occasional wrong targets
+			if (false && squad && squad->getSquadOrder().getPosition() != targetBase->getPosition())
+			{
+				BWAPI::Broodwar->printf("redirecting %s to %d,%d priority %d [ %s%shits %s%s]",
+					squad->getName().c_str(), targetBase->getTilePosition().x, targetBase->getTilePosition().y, bestScore,
+					(hasGround ? "ground " : ""),
+					(hasAir ? "air " : ""),
+					(canAttackGround ? "ground " : ""),
+					(canAttackAir ? "air " : ""));
+			}
+
+			return targetBase->getPosition();
+		}
+	}
+
+	// 1b. If we haven't found the enemy start location yet, pick an unexplored start location
+	// 1 b。如果我们还没有找到敌人的起始位置，选择一个未被发现的起始位置
+	if (!InformationManager::Instance().getEnemyMainBaseLocation())
+	{
+		for (BWTA::BaseLocation * startLocation : BWTA::getStartLocations())
+		{
+			if (!BWAPI::Broodwar->isExplored(startLocation->getTilePosition()))
+			{
+				return startLocation->getPosition();
+			}
+		}
+	}
+
+	// 2. Attack known enemy buildings.
+	// We assume that a terran can lift the buildings; otherwise, the squad must be able to attack ground.
+	// 2。攻击已知的敌人建筑。
+	//我们假设一个人族可以举起建筑;否则，小队必须能够攻击地面。
+	if (canAttackGround || BWAPI::Broodwar->enemy()->getRace() != BWAPI::Races::Zerg)
+	{
+		for (const auto & kv : InformationManager::Instance().getUnitInfo(BWAPI::Broodwar->enemy()))
+		{
+			const UnitInfo & ui = kv.second;
+
+			if (ui.type.isBuilding() && ui.lastPosition.isValid() && !ui.goneFromLastPosition && bwemMap.GetArea(BWAPI::WalkPosition(ui.lastPosition)))
+			{
+				return ui.lastPosition;
+			}
+		}
+	}
+
+	// 3. Attack visible enemy units.
+	// TODO score the units and attack the most important
+	for (const auto unit : BWAPI::Broodwar->enemy()->getUnits())
+	{
+		if (unit->getType() == BWAPI::UnitTypes::Zerg_Larva ||
+			!unit->exists() ||
+			!unit->isDetected() ||
+			!unit->getPosition().isValid())
+		{
+			continue;
+		}
+
+		if (unit->isFlying() && canAttackAir || !unit->isFlying() && canAttackGround)
+		{
+			return unit->getPosition();
+		}
+	}
+
+	// Special case: Plasma
+	// Here we only have a ground squad while we're doing a proxy 2-gate
+	// So attack any base we can reach that hasn't been explored yet
+	//特殊情况:等离子体
+	//在这里，我们只有一个地面小队，而我们在做一个2号门代理
+	//所以攻击任何我们可以到达的尚未被探测到的基地
+	if (BWAPI::Broodwar->mapHash() == "6f5295624a7e3887470f3f2e14727b1411321a67" &&
+		squad && squad->containsUnitType(BWAPI::UnitTypes::Protoss_Zealot))
+	{
+		BWAPI::Position squadCenter(squad->calcCenter());
+		for (BWTA::BaseLocation * base : BWTA::getBaseLocations())
+		{
+			if (InformationManager::Instance().getBaseOwner(base) != BWAPI::Broodwar->neutral()) continue;
+
+			// If there is no path to the base, continue
+			//如果没有到基地的路径，继续
+			auto path = PathFinding::GetChokePointPath(squadCenter, base->getPosition());
+			if (path.empty()) continue;
+
+			// Skip bases behind chokes that require mineral walking
+			//在需要矿物质行走的扼流后面跳过底部
+			for (auto choke : path)
+				if (((ChokeData*)choke->Ext())->requiresMineralWalk)
+					goto nextBase;
+
+			return base->getPosition();
+
+		nextBase:;
+		}
+	}
+
+	// 4. We can't see anything, so explore the map until we find something.
+	// 4。我们什么也看不见，所以在我们找到东西之前先看看地图。
 	return MapGrid::Instance().getLeastExplored(hasGround && !hasAir);
 }
 

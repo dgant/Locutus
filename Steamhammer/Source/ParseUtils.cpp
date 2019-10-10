@@ -180,7 +180,7 @@ void ParseUtils::ParseConfigFile(const std::string & filename)
 
 		// 0. Parse all the openings.
 		// Besides making them all available, this checks that they are syntatically valid.
-		std::vector<const std::string> openingNames;		// in case we want to make a random choice
+		std::vector<std::string> openingNames;		// in case we want to make a random choice
 		if (strategy.HasMember("Strategies") && strategy["Strategies"].IsObject())
 		{
 			const rapidjson::Value & strategies = strategy["Strategies"];
@@ -566,8 +566,11 @@ bool ParseUtils::_ParseStrategy(
                     // Strategies that have always won are given a * 100 boost (see OpponentModel)
                     // Here, we give strategies that we have never played a * 50 boost, so we are sure
                     // to try them once when other strategies start losing
+                    // (only enabled for tournaments, not ladders)
+                    /*
                     else
                         weight *= 50;
+                    */
 
                     Log().Get() << "Considering " << strategy << " with weight " << weight;
 

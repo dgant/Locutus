@@ -14,6 +14,7 @@ namespace Micro
     void AttackMove(BWAPI::Unit attacker, const BWAPI::Position & targetPosition);
     void Move(BWAPI::Unit attacker, const BWAPI::Position & targetPosition);
 	void RightClick(BWAPI::Unit unit, BWAPI::Unit target);
+	void RightClick(BWAPI::Unit unit, BWAPI::Position pos);
     void LaySpiderMine(BWAPI::Unit unit, BWAPI::Position pos);
     void Repair(BWAPI::Unit unit, BWAPI::Unit target);
 	bool Scan(const BWAPI::Position & targetPosition);

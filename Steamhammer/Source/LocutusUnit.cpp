@@ -3,8 +3,11 @@
 #include "InformationManager.h"
 #include "Micro.h"
 #include "MapTools.h"
+#include "PathFinding.h"
 
 const double pi = 3.14159265358979323846;
+
+const int DRAGOON_ATTACK_FRAMES = 6;
 
 namespace { auto & bwemMap = BWEM::Map::Instance(); }
 namespace { auto & bwebMap = BWEB::Map::Instance(); }
@@ -15,10 +18,20 @@ void LocutusUnit::update()
 {
 	if (!unit || !unit->exists()) { return; }
 
-    if (unit->getType() == BWAPI::UnitTypes::Protoss_Dragoon) updateGoon();
+	if (unit->getType() == BWAPI::UnitTypes::Protoss_Dragoon) updateGoon();
 
     if (unit->getPosition() != lastPosition)
     {
+		/*
+		if (unit->getDistance(lastPosition) > 4 * 32) {
+			if (!unit->getType().isWorker()) {
+				BWAPI::Unit closestUnit = unit->getClosestUnit(BWAPI::Filter::IsEnemy, unit->getType().sightRange());
+				if (closestUnit) {
+					Micro::AttackUnit(unit, closestUnit);
+				}
+			}
+		}
+		*/
         if (lastPosition.isValid())
             InformationManager::Instance().getMyUnitGrid().unitMoved(unit->getType(), lastPosition, unit->getPosition());
         else
@@ -29,14 +42,16 @@ void LocutusUnit::update()
 
     // If a worker is stuck, order it to move again
     // This will often happen when a worker can't get out of the mineral line to build something
+	//如果一个工人被困住了，命令他再次移动
+	//当一个工人不能走出矿物生产线去建造什么东西时，这种情况经常会发生
     if (unit->getType().isWorker() && 
-        unit->getLastCommand().getType() == BWAPI::UnitCommandTypes::Move &&
+		(unit->getLastCommand().getType() == BWAPI::UnitCommandTypes::Move || unit->getLastCommand().getType() == BWAPI::UnitCommandTypes::Attack_Move) &&
         unit->getLastCommand().getTargetPosition().isValid() &&
         (unit->getOrder() == BWAPI::Orders::PlayerGuard || !unit->isMoving()))
     {
-        Micro::Move(unit, unit->getLastCommand().getTargetPosition());
+		Micro::Move(unit, unit->getLastCommand().getTargetPosition());
         return;
-    }
+	}
 
     updateMoveWaypoints();
 }
@@ -46,30 +61,33 @@ bool LocutusUnit::moveTo(BWAPI::Position position, bool avoidNarrowChokes)
     // Fliers just move to the target
     if (unit->isFlying())
     {
-        Micro::Move(unit, position);
+        Micro::AttackMove(unit, position);
         return true;
     }
 
     // If the unit is already moving to this position, don't do anything
     BWAPI::UnitCommand currentCommand(unit->getLastCommand());
     if (position == targetPosition ||
-        (currentCommand.getType() == BWAPI::UnitCommandTypes::Move && currentCommand.getTargetPosition() == position))
+		((currentCommand.getType() == BWAPI::UnitCommandTypes::Move || currentCommand.getType() == BWAPI::UnitCommandTypes::Attack_Move) && currentCommand.getTargetPosition() == position))
         return true;
 
     // Clear any existing waypoints
     waypoints.clear();
     targetPosition = BWAPI::Positions::Invalid;
+    currentlyMovingTowards = BWAPI::Positions::Invalid;
     mineralWalkingPatch = nullptr;
 
-    // If the unit is already in the same region, just move it directly
-    if (bwemMap.GetNearestArea(BWAPI::WalkPosition(position)) == bwemMap.GetNearestArea(BWAPI::WalkPosition(unit->getPosition())))
+    // If the unit is already in the same area, or the target doesn't have an area, just move it directly
+	//如果单元已经在同一个区域，或者目标没有区域，直接移动它
+    auto targetArea = bwemMap.GetArea(BWAPI::WalkPosition(position));
+    if (!targetArea || targetArea == bwemMap.GetArea(BWAPI::WalkPosition(unit->getPosition())))
     {
-        Micro::Move(unit, position);
+        Micro::AttackMove(unit, position);
         return true;
     }
 
     // Get the BWEM path
-    auto& path = bwemMap.GetPath(unit->getPosition(), position);
+    auto& path = PathFinding::GetChokePointPath(unit->getPosition(), position, PathFinding::PathFindingOptions::UseNearestBWEMArea);
     if (path.empty()) return false;
 
     // Detect when we can't use the BWEM path:
@@ -80,9 +98,11 @@ bool LocutusUnit::moveTo(BWAPI::Position position, bool avoidNarrowChokes)
     bool bwemPathNarrow = false;
     for (const BWEM::ChokePoint * chokepoint : path)
     {
+        ChokeData & chokeData = *((ChokeData*)chokepoint->Ext());
+
         // Mineral walking data is stored in Ext, choke width is stored in Data (see MapTools)
-        if ((chokepoint->Ext() && !unit->getType().isWorker()) ||
-            (chokepoint->Data() < unit->getType().width()))
+        if ((chokeData.requiresMineralWalk && !unit->getType().isWorker()) ||
+            (chokeData.width < unit->getType().width()))
         {
             bwemPathValid = false;
             break;
@@ -90,7 +110,7 @@ bool LocutusUnit::moveTo(BWAPI::Position position, bool avoidNarrowChokes)
 
         // Check for narrow chokes
         // TODO: Fix this, our units just get confused
-        //if (avoidNarrowChokes && chokepoint->Data() < 96)
+        //if (avoidNarrowChokes && ((ChokeData*)chokepoint->Ext())->width < 96)
         //    bwemPathNarrow = true;
 
         // Push the waypoints on this pass on the assumption that we can use them
@@ -100,7 +120,11 @@ bool LocutusUnit::moveTo(BWAPI::Position position, bool avoidNarrowChokes)
     // Attempt to generate an alternate path if possible
     if (!bwemPathValid || bwemPathNarrow)
     {
-        auto alternatePath = pathAvoidingUnusableChokes(unit->getPosition(), position, unit->getType().width());
+        auto alternatePath = PathFinding::GetChokePointPathAvoidingUndesirableChokePoints(
+            unit->getPosition(), 
+            position, 
+            PathFinding::PathFindingOptions::UseNearestBWEMArea, 
+            unit->getType().width());
         if (!alternatePath.empty())
         {
             waypoints.clear();
@@ -126,7 +150,10 @@ void LocutusUnit::updateMoveWaypoints()
     if (waypoints.empty())
     {
         if (BWAPI::Broodwar->getFrameCount() - lastMoveFrame > BWAPI::Broodwar->getLatencyFrames())
+        {
             targetPosition = BWAPI::Positions::Invalid;
+            currentlyMovingTowards = BWAPI::Positions::Invalid;
+        }
         return;
     }
 
@@ -136,21 +163,27 @@ void LocutusUnit::updateMoveWaypoints()
         return;
     }
 
-    // If the unit command is no longer to move towards the first waypoint, clear the waypoints
+    // If the unit command is no longer to move towards our current target, clear the waypoints
     // This means we have ordered the unit to do something else in the meantime
     BWAPI::UnitCommand currentCommand(unit->getLastCommand());
-    BWAPI::Position firstWaypointPosition((*waypoints.begin())->Center());
-    if (currentCommand.getType() != BWAPI::UnitCommandTypes::Move || currentCommand.getTargetPosition() != firstWaypointPosition)
+	if ((currentCommand.getType() != BWAPI::UnitCommandTypes::Move || currentCommand.getType() == BWAPI::UnitCommandTypes::Attack_Move) || currentCommand.getTargetPosition() != currentlyMovingTowards)
     {
         waypoints.clear();
         targetPosition = BWAPI::Positions::Invalid;
+        currentlyMovingTowards = BWAPI::Positions::Invalid;
         return;
     }
 
-    // Wait until the unit is close to the current waypoint
-    if (unit->getDistance(firstWaypointPosition) > 100) return;
+    // Wait until the unit is close enough to the current target
+    if (unit->getDistance(currentlyMovingTowards) > 3 * 32) return;
 
-    // Move to the next waypoint
+    // If the current target is a narrow ramp, wait until we're even closer
+    // We want to make sure we go up the ramp far enough to see anything potentially blocking the ramp
+    ChokeData & chokeData = *((ChokeData*)(*waypoints.begin())->Ext());
+    if (chokeData.width < 96 && chokeData.isRamp && !BWAPI::Broodwar->isVisible(chokeData.highElevationTile))
+        return;
+
+    // AttackMove to the next waypoint
     waypoints.pop_front();
     moveToNextWaypoint();
 }
@@ -159,6 +192,8 @@ void LocutusUnit::moveToNextWaypoint()
 {
     // If there are no more waypoints, move to the target position
     // State will be reset after latency frames to avoid resetting the order later
+	//如果没有更多的路径点，移动到目标位置
+	//状态将在延迟帧之后重置，以避免稍后重新设置订单
     if (waypoints.empty())
     {
         Micro::Move(unit, targetPosition);
@@ -169,24 +204,24 @@ void LocutusUnit::moveToNextWaypoint()
     const BWEM::ChokePoint * nextWaypoint = *waypoints.begin();
 
     // Check if the next waypoint needs to be mineral walked
-    if (nextWaypoint->Ext())
+    if (((ChokeData*)nextWaypoint->Ext())->requiresMineralWalk)
     {
-        BWAPI::Unit firstPatch = ((MineralWalkChoke*)nextWaypoint->Ext())->firstMineralPatch;
-        BWAPI::Unit secondPatch = ((MineralWalkChoke*)nextWaypoint->Ext())->secondMineralPatch;
+        BWAPI::Unit firstPatch = ((ChokeData*)nextWaypoint->Ext())->firstMineralPatch;
+        BWAPI::Unit secondPatch = ((ChokeData*)nextWaypoint->Ext())->secondMineralPatch;
 
         // Determine which mineral patch to target
         // If exactly one of them requires traversing the choke point to reach, pick it
         // Otherwise pick the furthest
 
-        int firstLength;
+        int firstLength = PathFinding::GetGroundDistance(unit->getPosition(), firstPatch->getInitialPosition(), PathFinding::PathFindingOptions::UseNearestBWEMArea);
         bool firstTraversesChoke = false;
-        for (auto choke : bwemMap.GetPath(unit->getPosition(), firstPatch->getInitialPosition(), &firstLength))
+        for (auto choke : PathFinding::GetChokePointPath(unit->getPosition(), firstPatch->getInitialPosition(), PathFinding::PathFindingOptions::UseNearestBWEMArea))
             if (choke == nextWaypoint)
                 firstTraversesChoke = true;
 
-        int secondLength;
+        int secondLength = PathFinding::GetGroundDistance(unit->getPosition(), secondPatch->getInitialPosition(), PathFinding::PathFindingOptions::UseNearestBWEMArea);
         bool secondTraversesChoke = false;
-        for (auto choke : bwemMap.GetPath(unit->getPosition(), secondPatch->getInitialPosition(), &secondLength))
+        for (auto choke : PathFinding::GetChokePointPath(unit->getPosition(), secondPatch->getInitialPosition(), PathFinding::PathFindingOptions::UseNearestBWEMArea))
             if (choke == nextWaypoint)
                 secondTraversesChoke = true;
 
@@ -200,7 +235,36 @@ void LocutusUnit::moveToNextWaypoint()
         return;
     }
 
-    Micro::Move(unit, BWAPI::Position(nextWaypoint->Center()));
+    // Determine the position on the choke to move towards
+
+    // If it is a narrow ramp, move towards the point with highest elevation
+    // We do this to make sure we explore the higher elevation part of the ramp before bugging out if it is blocked
+    ChokeData & chokeData = *((ChokeData*)nextWaypoint->Ext());
+    if (chokeData.width < 96 && chokeData.isRamp)
+    {
+        currentlyMovingTowards = BWAPI::Position(chokeData.highElevationTile) + BWAPI::Position(16, 16);
+    }
+    else
+    {
+        // Get the next position after this waypoint
+        BWAPI::Position next = targetPosition;
+        if (waypoints.size() > 1) next = BWAPI::Position(waypoints[1]->Center());
+
+        // AttackMove to the part of the choke closest to the next position
+        int bestDist = INT_MAX;
+        for (auto walkPosition : nextWaypoint->Geometry())
+        {
+            BWAPI::Position pos(walkPosition);
+            int dist = pos.getApproxDistance(next);
+            if (dist < bestDist)
+            {
+                bestDist = dist;
+                currentlyMovingTowards = pos;
+            }
+        }
+    }
+
+    Micro::Move(unit, currentlyMovingTowards);
     lastMoveFrame = BWAPI::Broodwar->getFrameCount();
 }
 
@@ -211,7 +275,7 @@ void LocutusUnit::mineralWalk()
     {
         mineralWalkingPatch = nullptr;
 
-        // Move to the next waypoint
+        // AttackMove to the next waypoint
         waypoints.pop_front();
         moveToNextWaypoint();
         return;
@@ -247,12 +311,11 @@ void LocutusUnit::mineralWalk()
                 continue;
 
             // Check that there is a path to the tile
-            int pathLength;
-            auto path = bwemMap.GetPath(unit->getPosition(), tileCenter, &pathLength);
+            int pathLength = PathFinding::GetGroundDistance(unit->getPosition(), tileCenter, PathFinding::PathFindingOptions::UseNearestBWEMArea);
             if (pathLength == -1) continue;
 
             // The path should not cross the choke we're mineral walking
-            for (auto choke : path)
+            for (auto choke : PathFinding::GetChokePointPath(unit->getPosition(), tileCenter, PathFinding::PathFindingOptions::UseNearestBWEMArea))
                 if (choke == *waypoints.begin())
                     goto cnt;
 
@@ -278,6 +341,7 @@ void LocutusUnit::mineralWalk()
 
         waypoints.clear();
         targetPosition = BWAPI::Positions::Invalid;
+        currentlyMovingTowards = BWAPI::Positions::Invalid;
         mineralWalkingPatch = nullptr;
         return;
     }
@@ -287,8 +351,8 @@ void LocutusUnit::mineralWalk()
     BWAPI::Position tile = bestPos;
     if (unit->getDistance(tile) < 16) tile = worstPos;
 
-    // Move towards the tile
-    Micro::Move(unit, tile);
+    // AttackMove towards the tile
+    Micro::AttackMove(unit, tile);
     lastMoveFrame = BWAPI::Broodwar->getFrameCount();
 }
 
@@ -361,8 +425,33 @@ breakOuterLoop:;
 
     if (bestPosition.isValid())
     {
-        Micro::Move(unit, bestPosition);
+        Micro::AttackMove(unit, bestPosition);
     }
+}
+
+int LocutusUnit::distanceToMoveTarget() const
+{
+    // If we're currently doing a move with waypoints, sum up the total ground distance
+    if (targetPosition.isValid())
+    {
+        BWAPI::Position current = unit->getPosition();
+        int dist = 0;
+        for (auto waypoint : waypoints)
+        {
+            dist += current.getApproxDistance(BWAPI::Position(waypoint->Center()));
+            current = BWAPI::Position(waypoint->Center());
+        }
+        return dist + current.getApproxDistance(targetPosition);
+    }
+
+    // Otherwise, if the unit has a move order, compute the simple air distance
+    // Usually this means the unit is already in the same area as the target (or is a flier)
+    BWAPI::UnitCommand currentCommand(unit->getLastCommand());
+	if (currentCommand.getType() == BWAPI::UnitCommandTypes::Move || currentCommand.getType() == BWAPI::UnitCommandTypes::Attack_Move)
+        return unit->getDistance(currentCommand.getTargetPosition());
+
+    // The unit is not moving
+    return INT_MAX;
 }
 
 bool LocutusUnit::isReady() const
@@ -372,8 +461,8 @@ bool LocutusUnit::isReady() const
     // Compute delta between current frame and when the last attack started / will start
     int attackFrameDelta = BWAPI::Broodwar->getFrameCount() - lastAttackStartedAt;
 
-    // Always give the dragoon 9 frames to perform their attack before getting another order
-    if (attackFrameDelta >= 0 && attackFrameDelta <= 9 - BWAPI::Broodwar->getRemainingLatencyFrames())
+    // Always give the dragoon some frames to perform their attack before getting another order
+    if (attackFrameDelta >= 0 && attackFrameDelta <= DRAGOON_ATTACK_FRAMES - BWAPI::Broodwar->getRemainingLatencyFrames())
     {
         return false;
     }
@@ -411,99 +500,11 @@ bool LocutusUnit::isStuck() const
         potentiallyStuckSince < (BWAPI::Broodwar->getFrameCount() - BWAPI::Broodwar->getLatencyFrames() - 10);
 }
 
-// Basically BWEB's path find alorithm modified to use BWEM chokepoints
-std::vector<const BWEM::ChokePoint *> LocutusUnit::pathAvoidingUnusableChokes(
-    BWAPI::Position start, 
-    BWAPI::Position target, 
-    int minChokeWidth,
-    int desiredChokeWidth)
-{
-    const BWEM::Area * startArea = bwemMap.GetNearestArea(BWAPI::WalkPosition(start));
-    const BWEM::Area * targetArea = bwemMap.GetNearestArea(BWAPI::WalkPosition(target));
-
-    struct Node {
-        Node(const BWEM::ChokePoint * choke, int const dist, const BWEM::Area * toArea, const BWEM::ChokePoint * parent) 
-            : choke{ choke }, dist{ dist }, toArea{ toArea }, parent{ parent } { }
-        mutable const BWEM::ChokePoint * choke;
-        mutable int dist;
-        mutable const BWEM::Area * toArea;
-        mutable const BWEM::ChokePoint * parent = nullptr;
-    };
-
-    const auto validChoke = [](const BWEM::ChokePoint * choke, int minChokeWidth) {
-        return !choke->Blocked() && !choke->Ext() && choke->Data() >= minChokeWidth;
-    };
-
-    const auto chokeDist = [](const BWEM::ChokePoint * choke, int dist, int desiredChokeWidth) {
-        // Give too narrow chokes a large penalty, so they are only used if there is no other option
-        if (choke->Data() < desiredChokeWidth) return dist + 2000;
-        return dist;
-    };
-
-    const auto chokeTo = [](const BWEM::ChokePoint * choke, const BWEM::Area * from) {
-        return (from == choke->GetAreas().first)
-            ? choke->GetAreas().second
-            : choke->GetAreas().first;
-    };
-
-    const auto createPath = [](const Node& node, std::map<const BWEM::ChokePoint *, const BWEM::ChokePoint *> & parentMap) {
-        std::vector<const BWEM::ChokePoint *> path;
-        const BWEM::ChokePoint * current = node.choke;
-
-        while (current)
-        {
-            path.push_back(current);
-            current = parentMap[current];
-        }
-
-        std::reverse(path.begin(), path.end());
-
-        return path;
-    };
-
-    auto cmp = [](Node left, Node right) { return left.dist > right.dist; };
-    std::priority_queue<Node, std::vector<Node>, decltype(cmp)> nodeQueue(cmp);
-    for (auto choke : startArea->ChokePoints())
-        if (validChoke(choke, minChokeWidth))
-            nodeQueue.emplace(
-                choke,
-                chokeDist(choke, start.getApproxDistance(BWAPI::Position(choke->Center())), desiredChokeWidth),
-                chokeTo(choke, startArea),
-                nullptr);
-
-    std::map<const BWEM::ChokePoint *, const BWEM::ChokePoint *> parentMap;
-
-    while (!nodeQueue.empty()) {
-        auto const current = nodeQueue.top();
-        nodeQueue.pop();
-
-        // Set parent
-        parentMap[current.choke] = current.parent;
-
-        // If at target, return path
-        // We're ignoring the distance from this last choke to the target position; it's an unlikely
-        // edge case that there is an alternate choke giving a significantly better result
-        if (current.toArea == targetArea)
-            return createPath(current, parentMap);
-
-        // Add valid connected chokes we haven't visited yet
-        for (auto choke : current.toArea->ChokePoints())
-            if (validChoke(choke, minChokeWidth) && parentMap.find(choke) == parentMap.end())
-                nodeQueue.emplace(
-                    choke, 
-                    chokeDist(choke, current.dist + choke->DistanceFrom(current.choke), desiredChokeWidth), 
-                    chokeTo(choke, current.toArea), 
-                    current.choke);
-    }
-
-    return {};
-}
-
 void LocutusUnit::updateGoon()
 {
     // If we're not currently in an attack, determine the frame when the next attack will start
     if (lastAttackStartedAt >= BWAPI::Broodwar->getFrameCount() ||
-        BWAPI::Broodwar->getFrameCount() - lastAttackStartedAt > 9 - BWAPI::Broodwar->getRemainingLatencyFrames())
+        BWAPI::Broodwar->getFrameCount() - lastAttackStartedAt > DRAGOON_ATTACK_FRAMES - BWAPI::Broodwar->getRemainingLatencyFrames())
     {
         lastAttackStartedAt = 0;
 

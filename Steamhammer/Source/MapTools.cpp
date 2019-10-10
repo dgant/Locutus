@@ -3,7 +3,10 @@
 #include "BuildingPlacer.h"
 #include "InformationManager.h"
 
+const double pi = 3.14159265358979323846;
+
 namespace { auto & bwemMap = BWEM::Map::Instance(); }
+namespace { auto & bwebMap = BWEB::Map::Instance(); }
 
 using namespace UAlbertaBot;
 
@@ -34,12 +37,53 @@ MapTools::MapTools()
         for (const BWEM::ChokePoint * choke : area.ChokePoints())
             chokes.insert(choke);
 
-    // Store the width of each chokepoint in its data field
+    // Store a ChokeData object for each choke
     for (const BWEM::ChokePoint * choke : chokes)
     {
+        choke->SetExt(new ChokeData(choke));
+        ChokeData & chokeData = *((ChokeData*)choke->Ext());
+
+        // Compute the choke width
         // Because the ends are themselves walkable tiles, we need to add a bit of padding to estimate the actual walkable width of the choke
         int width = BWAPI::Position(choke->Pos(choke->end1)).getApproxDistance(BWAPI::Position(choke->Pos(choke->end2))) + 15;
-        choke->SetData(width);
+        chokeData.width = width;
+
+        // Determine if the choke is a ramp
+        int firstAreaElevation = BWAPI::Broodwar->getGroundHeight(BWAPI::TilePosition(choke->GetAreas().first->Top()));
+        int secondAreaElevation = BWAPI::Broodwar->getGroundHeight(BWAPI::TilePosition(choke->GetAreas().second->Top()));
+        if (firstAreaElevation != secondAreaElevation)
+        {
+            chokeData.isRamp = true;
+
+            // For narrow ramps with a difference in elevation, compute a tile at high elevation close to the choke
+            // We will use this for pathfinding
+            if (chokeData.width < 96)
+            {
+                // Start by computing the angle of the choke
+                BWAPI::Position chokeDelta(choke->Pos(choke->end1) - choke->Pos(choke->end2));
+                double chokeAngle = atan2(chokeDelta.y, chokeDelta.x);
+
+                // Now find a tile a bit away from the middle of the choke that is at high elevation
+                int highestElevation = std::max(firstAreaElevation, secondAreaElevation);
+                BWAPI::Position center(choke->Center());
+                BWAPI::TilePosition closestToCenter = BWAPI::TilePositions::Invalid;
+                for (int step = 0; step <= 6; step++)
+                    for (int direction = -1; direction <= 1; direction += 2)
+                    {
+                        BWAPI::TilePosition tile(BWAPI::Position(
+                            center.x - (int)std::round(16 * step * std::cos(chokeAngle + direction * (pi / 2.0))),
+                            center.y - (int)std::round(16 * step * std::sin(chokeAngle + direction * (pi / 2.0)))));
+
+                        if (!tile.isValid()) continue;
+                        if (!bwebMap.isWalkable(tile)) continue;
+
+                        if (BWAPI::Broodwar->getGroundHeight(tile) == highestElevation)
+                        {
+                            chokeData.highElevationTile = tile;
+                        }
+                    }
+            }
+        }
     }
 
     // On Plasma, we enrich the BWEM chokepoints with data about mineral walking
@@ -48,6 +92,7 @@ MapTools::MapTools()
         // Process each choke
         for (const BWEM::ChokePoint * choke : chokes)
         {
+            ChokeData & chokeData = *((ChokeData*)choke->Ext());
             BWAPI::Position chokeCenter(choke->Center());
 
             // Determine if the choke is blocked by eggs, and grab the close mineral patches
@@ -85,7 +130,9 @@ MapTools::MapTools()
 
             if (!blockedByEggs) continue;
 
-            choke->SetExt(new MineralWalkChoke(closestMineralPatch, secondClosestMineralPatch));
+            chokeData.requiresMineralWalk = true;
+            chokeData.firstMineralPatch = closestMineralPatch;
+            chokeData.secondMineralPatch = secondClosestMineralPatch;
         }
     }
 
@@ -358,13 +405,13 @@ BWTA::BaseLocation * MapTools::nextExpansion(bool hidden, bool wantMinerals, boo
 		{
 			continue;
 		}
-        
-		// Don't expand to a base already reserved for another expansion.
-		if (InformationManager::Instance().isBaseReserved(base))
-		{
-			continue;
-		}
 
+        // Don't expand to a spider-mined base.
+        if (InformationManager::Instance().getBase(base)->spiderMined)
+        {
+            continue;
+        }
+        
 		BWAPI::TilePosition tile = base->getTilePosition();
         bool buildingInTheWay = false;
 
@@ -469,15 +516,110 @@ BWAPI::TilePosition MapTools::getNextExpansion(bool hidden, bool wantMinerals, b
 	}
 	return BWAPI::TilePositions::None;
 }
-
-BWAPI::TilePosition MapTools::reserveNextExpansion(bool hidden, bool wantMinerals, bool wantGas)
-{
-	BWTA::BaseLocation * base = nextExpansion(hidden, wantMinerals, wantGas);
-	if (base)
-	{
-		// BWAPI::Broodwar->printf("reserve base @ %d, %d", base->getTilePosition().x, base->getTilePosition().y);
-		InformationManager::Instance().reserveBase(base);
-		return base->getTilePosition();
+/*
+获取距离起点坐标指定长度的坐标
+*/
+BWAPI::Position MapTools::getDistancePosition(BWAPI::Position start, BWAPI::Position end, double dist) {
+	double distance = sqrt(pow(start.x - end.x, 2) + pow(start.y - end.y, 2));// 两点的坐标距离
+	double lenthUnit = distance / 5;// 单位长度
+	// 第一步：求得直线方程相关参数y=kx+b
+	double k = (start.y - end.y) * 1.0 / (start.x - end.x);// 坐标直线斜率k
+	double b = start.y - k * start.x;// 坐标直线b
+	// 第二步：求得在直线y=kx+b上，距离当前坐标距离为L的某点
+	// 一元二次方程Ax^2+Bx+C=0中,
+	// 一元二次方程求根公式：
+	// 两根x1,x2= [-B±√(B^2-4AC)]/2A
+	// ①(y-y0)^2+(x-x0)^2=L^2;
+	// ②y=kx+b;
+	// 式中x,y即为根据以上lenthUnit单位长度(这里就是距离L)对应点的坐标
+	// 由①②表达式得到:(k^2+1)x^2+2[(b-y0)k-x0]x+[(b-y0)^2+x0^2-L^2]=0
+	double A = pow(k, 2) + 1;// A=k^2+1;
+	double B = 2 * ((b - start.y) * k - start.x);// B=2[(b-y0)k-x0];
+	int m = 1;
+	double L = m * dist;
+	// C=(b-y0)^2+x0^2-L^2
+	double C = pow(b - start.y, 2) + pow(start.x, 2)
+		- pow(L, 2);
+	// 两根x1,x2= [-B±√(B^2-4AC)]/2A
+	double x1 = (-B + sqrt(pow(B, 2) - 4 * A * C)) / (2 * A);
+	double x2 = (-B - sqrt(pow(B, 2) - 4 * A * C)) / (2 * A);
+	double x = 0;// 最后确定是在已知两点之间的某点
+	if (x1 == x2) {
+		x = x1;
 	}
-	return BWAPI::TilePositions::None;
+	else if (start.x <= x1 && x1 <= end.x || end.x <= x1
+		&& x1 <= start.x) {
+		x = x1;
+	}
+	else if (start.x <= x2 && x2 <= end.x || end.x <= x2
+		&& x2 <= start.x) {
+		x = x2;
+	}
+	double y = k * x + b;
+
+	return BWAPI::Position(x, y);
+}
+
+/*
+获取距离起点延长指定长度的坐标
+*/
+BWAPI::Position MapTools::getExtendedPosition(BWAPI::Position start, BWAPI::Position end, double dist) {
+	double xab, yab;
+	double xbd, ybd;
+	double xd, yd;
+
+	xab = start.x - end.x;
+	yab = start.y - end.y;
+
+	xbd = sqrt((dist * dist) / ((yab / xab) * (yab / xab) + 1));
+
+	if (xab > 0) {
+		xbd = sqrt((dist * dist) / ((yab / xab) * (yab / xab) + 1));
+	}
+	else {
+		xbd = -sqrt((dist * dist) / ((yab / xab) * (yab / xab) + 1));
+	}
+
+	xd = start.x + xbd;
+	yd = start.y + yab / xab * xbd;
+
+	//printf("xd=%f,yd=%f\n", xd, yd);
+	return BWAPI::Position(xd, yd);
+}
+
+//求点到圆的切点
+void MapTools::getCutPoint(BWAPI::Position center, double radius, BWAPI::Position sp, BWAPI::Position & rp1, BWAPI::Position & rp2)
+{
+	double m = sp.x, n = sp.y;
+	double a = center.x, b = center.y;
+	double r = radius;
+
+	double dx = center.x - sp.x;
+	double dy = center.y - sp.y;
+	//计算点击处与圆心相对于X轴的夹角
+	double r1 = atan2(dy, dx);
+	//计算点击处与圆心、点击处与切点1这两条线段间的夹角
+	double d1 = sqrt(dx*dx + dy*dy);
+	double r2 = asin(radius / d1);
+	//计算从切点1向圆的垂直直径做垂线形成的直角三角形的一个角
+	double r3 = r1 - r2;
+	//计算坐标系中的角度
+	double r4 = r3 - 3.1415926 / 2;
+	//计算切点1相对于圆心的x、y坐标
+	double x1 = radius * cos(r4);
+	double y1 = radius * sin(r4);
+
+	//计算点击处与切线2相对于X轴的夹角
+	double r5 = 3.1415926 / 2 - r1 - r2;
+	//计算坐标系中的角度
+	double r6 = -r5;
+	//计算切点2相对于圆心的x、y坐标
+	double x2 = radius * cos(r6);
+	double y2 = radius * sin(r6);
+
+	rp1.x = center.x + x1;
+	rp1.y = center.y + y1;
+
+	rp2.x = center.x - x2;
+	rp2.y = center.y - y2;
 }

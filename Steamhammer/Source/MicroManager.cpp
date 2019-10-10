@@ -3,6 +3,8 @@
 #include "Squad.h"
 #include "MapTools.h"
 #include "UnitUtil.h"
+#include "MathUtil.h"
+#include "PathFinding.h"
 
 using namespace UAlbertaBot;
 
@@ -75,18 +77,24 @@ void MicroManager::getTargets(BWAPI::Unitset & targets) const
 {
 	// Always include enemies in the radius of the order.
 	MapGrid::Instance().getUnits(targets, order.getPosition(), order.getRadius(), false, true);
+	
+	for (const auto unit : _units)
+	{
+		MapGrid::Instance().getUnits(targets, unit->getPosition(), unit->getType().sightRange(), false, true);
+	}
 
 	// For some orders, add enemies which are near our units.
-	if ((order.getType() == SquadOrderTypes::Attack || 
+	/*
+	if (order.getType() == SquadOrderTypes::Attack || 
 	    order.getType() == SquadOrderTypes::KamikazeAttack || 
-        order.getType() == SquadOrderTypes::Defend) &&
-        !StrategyManager::Instance().isRushing())
+        order.getType() == SquadOrderTypes::Defend)
 	{
 		for (const auto unit : _units)
 		{
 			MapGrid::Instance().getUnits(targets, unit->getPosition(), unit->getType().sightRange(), false, true);
 		}
 	}
+	*/
 }
 
 // Determine if we should ignore the given target and look for something better closer to our order position
@@ -94,46 +102,82 @@ bool MicroManager::shouldIgnoreTarget(BWAPI::Unit combatUnit, BWAPI::Unit target
 {
     if (!combatUnit || !target) return true;
 
-    // If we are already close to our order position, this is the best target we're going to get
-    if (combatUnit->getDistance(order.getPosition()) <= 200) return false;
-
-    // If there isn't an enemy resource depot at the order position, then let our units pick their targets at will
-    // This is so we don't ignore outlying buildings after we've already razed the center of the base
-    bool resourceDepotAtOrderPosition = false;
-    for (auto & unit : InformationManager::Instance().getUnitInfo(BWAPI::Broodwar->enemy()))
-    {
-        if (unit.second.type.isResourceDepot() && order.getPosition() == unit.second.lastPosition)
-        {
-            resourceDepotAtOrderPosition = true;
-            break;
-        }
-    }
-    if (!resourceDepotAtOrderPosition) return false;
-
     // Check if this unit is currently performing a run-by of a bunker
     // If so, ignore all targets while we are doing the run-by
     auto bunkerRunBySquad = CombatCommander::Instance().getSquadData().getSquad(this).getBunkerRunBySquad(combatUnit);
-    if (bunkerRunBySquad)
+    if (bunkerRunBySquad && bunkerRunBySquad->isPerformingRunBy(combatUnit))
     {
-        // We consider ourselves as doing the run-by when either:
-        // - We are in firing range of the bunker
-        // - We are closer to the bunker than our current run-by position
-        int bunkerRange = InformationManager::Instance().enemyHasInfantryRangeUpgrade() ? 6 * 32 : 5 * 32;
-        auto runByPosition = bunkerRunBySquad->getRunByPosition(combatUnit, order.getPosition());
-        int distanceToBunker = combatUnit->getDistance(bunkerRunBySquad->getBunker());
-        if (distanceToBunker < (bunkerRange + 32) || distanceToBunker < combatUnit->getDistance(runByPosition))
+        return true;
+    }
+
+    // If the target base is no longer owned by the enemy, let our units pick their targets at will
+    // This is so we don't ignore outlying buildings after we've already razed the center of the base
+    auto base = InformationManager::Instance().baseAt(BWAPI::TilePosition(order.getPosition()));
+    if (!base || base->getOwner() != BWAPI::Broodwar->enemy()) return false;
+
+    // In some cases we want to ignore solitary bunkers and units covered by them
+    // This may be because we have done a run-by or are waiting to do one
+    if (BWAPI::Broodwar->enemy()->getRace() == BWAPI::Races::Terran)
+    {
+        // First try to find a solitary bunker
+        BWAPI::Unit solitaryBunker = nullptr;
+        for (auto unit : BWAPI::Broodwar->enemy()->getUnits())
         {
-            return true;
+            if (!unit->exists() || !unit->isVisible() || !unit->isCompleted()) continue;
+            if (unit->getType() != BWAPI::UnitTypes::Terran_Bunker) continue;
+
+            // Break if this is the second bunker
+            if (solitaryBunker)
+            {
+                solitaryBunker = nullptr;
+                break;
+            }
+
+            solitaryBunker = unit;
         }
+
+        // If it was found, do the checks
+        if (solitaryBunker)
+        {
+            // The target is the bunker: ignore it if we are closer to the order position
+            if (target->getType() == BWAPI::UnitTypes::Terran_Bunker)
+            {
+                int unitDist = PathFinding::GetGroundDistance(combatUnit->getPosition(), order.getPosition());
+                int bunkerDist = PathFinding::GetGroundDistance(solitaryBunker->getPosition(), order.getPosition());
+                if (unitDist != -1 && bunkerDist != -1 && unitDist < (bunkerDist - 128)) return true;
+            }
+
+            // The target isn't a bunker: ignore it if we can't attack it without coming under fire
+            else
+            {
+                int bunkerRange = InformationManager::Instance().enemyHasInfantryRangeUpgrade() ? 6 * 32 : 5 * 32;
+                int ourRange = std::max(0, UnitUtil::GetAttackRange(combatUnit, target) - 64); // be pessimistic and subtract two tiles
+                if (target->getDistance(solitaryBunker) < (bunkerRange - ourRange + 32)) return true;
+            }
+        }
+    }
+
+    // If we are already close to our order position, this is the best target we're going to get
+    if (combatUnit->getDistance(order.getPosition()) <= 200) return false;
+
+    // Ignore workers far from the order position when rushing or doing a kamikaze attack
+    if ((StrategyManager::Instance().isRushing() && order.getType() == SquadOrderTypes::Attack) ||
+        order.getType() == SquadOrderTypes::KamikazeAttack)
+    {
+        if (combatUnit->getDistance(order.getPosition()) > 500 &&
+            target->getType().isWorker() &&
+            !target->isConstructing()) return true;
     }
 
     // Consider outlying buildings
     // Static defenses are handled separately so we can consider run-bys as a squad
-    // TODO: Detect when the building is part of a wall and act accordingly
     if (target->getType().isBuilding())
     {
         // Never ignore static defenses
         if (target->isCompleted() && UnitUtil::CanAttackGround(target)) return false;
+
+        // Never ignore buildings that are part of walls
+        if (InformationManager::Instance().isEnemyWallBuilding(target)) return false;
 
         // Otherwise, let's ignore this and find something better to attack
         return true;
@@ -194,10 +238,19 @@ void MicroManager::regroup(
 			Micro::AttackMove(unit, unit->getPosition());
             continue;
 		}
+        
+        // If we are rushing, maybe add this unit to a bunker attack squad
+        // It will handle keeping our distance until we want to attack or run-by
+        if (StrategyManager::Instance().isRushing() &&
+            CombatCommander::Instance().getSquadData().getSquad(this).addUnitToBunkerAttackSquadIfClose(unit))
+        {
+            continue;
+        }
 
         // Determine position to move towards
-        // When rushing, we may move towards the vanguard unit when it is safe to do so
-        BWAPI::Position regroupTo = (StrategyManager::Instance().isRushing() && vanguard && !nearEnemy[unit])
+        // If we are a long way away from the vanguard unit and not near an enemy, move towards it
+        BWAPI::Position regroupTo = 
+            (vanguard && !nearEnemy[unit] && (StrategyManager::Instance().isRushing() || vanguard->getDistance(unit) > 500 || !nearEnemy[vanguard]))
             ? vanguard->getPosition()
             : regroupPosition;
 
@@ -205,7 +258,13 @@ void MicroManager::regroup(
 		{
 			if (!mobilizeUnit(unit))
 			{
-                InformationManager::Instance().getLocutusUnit(unit).moveTo(regroupTo, order.getType() == SquadOrderTypes::Attack);
+                // If we have already sent a move order very recently, don't send another one
+                // Sometimes we do it too often and the goons get stuck
+                if (unit->getLastCommand().getType() != BWAPI::UnitCommandTypes::Move ||
+                    BWAPI::Broodwar->getFrameCount() - unit->getLastCommandFrame() > 3)
+                {
+                    InformationManager::Instance().getLocutusUnit(unit).moveTo(regroupTo, order.getType() == SquadOrderTypes::Attack);
+                }
 				//Micro::Move(unit, regroupPosition);
 			}
 		}
@@ -222,14 +281,16 @@ bool MicroManager::buildScarabOrInterceptor(BWAPI::Unit u) const
 {
 	if (u->getType() == BWAPI::UnitTypes::Protoss_Reaver)
 	{
-		if (!u->isTraining() && u->canTrain(BWAPI::UnitTypes::Protoss_Scarab))
+		//if (!u->isTraining() && u->canTrain(BWAPI::UnitTypes::Protoss_Scarab))
+		if ( u->canTrain(BWAPI::UnitTypes::Protoss_Scarab))
 		{
 			return u->train(BWAPI::UnitTypes::Protoss_Scarab);
 		}
 	}
 	else if (u->getType() == BWAPI::UnitTypes::Protoss_Carrier)
 	{
-		if (!u->isTraining() && u->canTrain(BWAPI::UnitTypes::Protoss_Interceptor))
+		//if (!u->isTraining() && u->canTrain(BWAPI::UnitTypes::Protoss_Interceptor))
+		if (u->canTrain(BWAPI::UnitTypes::Protoss_Interceptor))
 		{
 			return u->train(BWAPI::UnitTypes::Protoss_Interceptor);
 		}
@@ -366,6 +427,97 @@ void MicroManager::useShieldBattery(BWAPI::Unit unit, BWAPI::Unit shieldBattery)
 		// BWAPI::Broodwar->printf("recharge shields %d at %d", unit->getID(), shieldBattery->getID());
 		Micro::RightClick(unit, shieldBattery);
 	}
+}
+
+BWAPI::Position MicroManager::getFleePosition(BWAPI::Unit unit, BWAPI::Unit target) {
+	return getFleePosition(unit->getPosition(), target->getPosition(), unit->getType().sightRange());
+}
+
+BWAPI::Position MicroManager::getFleePosition(BWAPI::Position form, BWAPI::Position to, int dist){
+	BWAPI::Position fleePosition = MapTools::Instance().getExtendedPosition(form, to, dist);// - dist
+
+	return fleePosition;
+}
+
+BWAPI::Position MicroManager::cutFleeFrom(BWAPI::Unit unit, BWAPI::Position position, int distance) {
+	int frame = BWAPI::Broodwar->getFrameCount();
+	BWAPI::Position orderTargetPosition = unit->getOrderTargetPosition();
+
+	BWAPI::Position rp1, rp2, pos;
+	MapTools::Instance().getCutPoint(position, distance, unit->getPosition(), rp1, rp2);
+	if (rp1.isValid() && rp2.isValid()) {
+		pos = rp1;
+		if (orderTargetPosition.getDistance(rp1) > orderTargetPosition.getDistance(rp2)) {
+			pos = rp2;
+		}
+
+		BWAPI::Broodwar->drawCircleMap(position, distance, BWAPI::Colors::Red);
+		BWAPI::Broodwar->drawCircleMap(pos, 4, BWAPI::Colors::Green, true);
+
+		if (pos.isValid() && pos.x > 0 && pos.y > 0) {
+			if (position.getDistance(pos) < unit->getDistance(pos)) return orderTargetPosition;
+
+			if (unit->getDistance(orderTargetPosition) > unit->getType().sightRange()) {
+
+				if (unit->getDistance(orderTargetPosition) > orderTargetPosition.getDistance(pos)) {
+					pos = MapTools::Instance().getExtendedPosition(pos, unit->getPosition(), 3 * 32);
+				}
+
+				//Micro::RightClick(unit, pos);
+				//retreatUnit[unit] = frame + unit->getDistance(pos) / unit->getType().topSpeed() - 2 * 24;
+
+				return pos;
+			}
+		}
+	}
+
+	return orderTargetPosition;
+}
+
+//获取标记分数
+int	MicroManager::getMarkTargetScore(BWAPI::Unit target, int score){
+	/*
+	int num = 2;
+	if (target->getType().size() == BWAPI::UnitSizeTypes::Small)
+	{
+		num = 4;
+	}
+	else if (target->getType().size() == BWAPI::UnitSizeTypes::Medium)
+	{
+		num = 6;
+	}
+	else if (target->getType().size() == BWAPI::UnitSizeTypes::Large)
+	{
+		num = 8;
+	}
+	else {
+		num = 10;
+	}
+
+	if (InformationManager::Instance().getAttackNumbers(target) < num) {
+		score += 1 * 32;
+	}
+	else {
+		score = 2 * 32;
+	}
+
+	if (InformationManager::Instance().getAttackDamages(target) > (target->getHitPoints() + target->getShields())) {
+		score = 32;
+	}
+	else 
+	*/
+
+	if (InformationManager::Instance().getAttackDamages(target) > (target->getHitPoints() + target->getShields()) * 0.3) {
+		score += 2 * 32;
+	}
+
+	return score;
+}
+
+//标记攻击单位数和伤害
+void MicroManager::setMarkTargetScore(BWAPI::Unit target, BWAPI::UnitType unitType) {
+	InformationManager::Instance().setAttackDamages(target, BWAPI::Broodwar->getDamageFrom(unitType, target->getType()));
+	InformationManager::Instance().setAttackNumbers(target, 1);
 }
 
 void MicroManager::drawOrderText() 

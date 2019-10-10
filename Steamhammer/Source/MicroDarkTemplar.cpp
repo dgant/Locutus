@@ -24,7 +24,7 @@ void MicroDarkTemplar::executeMicro(const BWAPI::Unitset & targets)
 			!target->isFlying() &&
 			target->getPosition().isValid() &&
 			target->getType() != BWAPI::UnitTypes::Zerg_Larva && 
-			target->getType() != BWAPI::UnitTypes::Zerg_Egg &&
+			//target->getType() != BWAPI::UnitTypes::Zerg_Egg &&
 			!target->isStasised() &&
 			!target->isUnderDisruptionWeb())             // melee unit can't attack under dweb
 		{
@@ -45,27 +45,48 @@ void MicroDarkTemplar::executeMicro(const BWAPI::Unitset & targets)
 
 	for (const auto meleeUnit : meleeUnits)
 	{
+		bool changOrder = false;
+
         if (unstickStuckUnit(meleeUnit))
         {
             continue;
         }
 
-        // If in range of a detector, consider fleeing from it
-        for (auto const & detector : enemyDetectors)
-            if (meleeUnit->getDistance(detector.first) <= (detector.second.isBuilding() ? 9 * 32 : 12 * 32))
-            {
-                if (!meleeUnit->isUnderAttack() && !UnitUtil::TypeCanAttackGround(detector.second)) continue;
+		if (order.isHarass()) {
+			// If in range of a detector, consider fleeing from it
+			for (auto const & detector : enemyDetectors) {
+				int distance = (detector.second.isBuilding() ? 9 * 32 : 12 * 32);
+				if (meleeUnit->getDistance(detector.first) <= distance)
+				{
+					if (!meleeUnit->isUnderAttack() && !UnitUtil::TypeCanAttackGround(detector.second)) continue;
 
-                InformationManager::Instance().getLocutusUnit(meleeUnit).fleeFrom(detector.first);
-                goto nextUnit; // continue outer loop
-            }
+					//InformationManager::Instance().getLocutusUnit(meleeUnit).fleeFrom(detector.first);
+
+					BWAPI::Position position = cutFleeFrom(meleeUnit, detector.first, distance);
+					if (position.isValid() && position.getDistance(detector.first) > distance) {
+						InformationManager::Instance().getLocutusUnit(meleeUnit).fleeFrom(detector.first);
+					}
+					else {
+						InformationManager::Instance().getLocutusUnit(meleeUnit).fleeFrom(position);//detector.first
+					}
+
+					//order.setPosition(meleeUnit->getPosition());
+					changOrder = true;
+					break;
+					//goto nextUnit; // continue outer loop
+				}
+			}
+		}
 
 		BWAPI::Unit target = getTarget(meleeUnit, meleeUnitTargets);
 		if (target)
 		{
+			if (changOrder) {
+				order.setPosition(target->getPosition());
+			}
 			Micro::AttackUnit(meleeUnit, target);
 		}
-		else if (meleeUnit->getDistance(order.getPosition()) > 96)
+		else if (meleeUnit->getDistance(order.getPosition()) > meleeUnit->getType().sightRange())
 		{
 			// There are no targets. Move to the order position if not already close.
             InformationManager::Instance().getLocutusUnit(meleeUnit).moveTo(order.getPosition());
@@ -96,6 +117,7 @@ BWAPI::Unit MicroDarkTemplar::getTarget(BWAPI::Unit meleeUnit, const BWAPI::Unit
 			meleeUnit->getDistance(order.getPosition()) - target->getDistance(order.getPosition());
 
 		// Skip targets that are too far away to worry about.
+		//跳过那些太远而不用担心的目标。
 		if (range >= 13 * 32)
 		{
 			continue;
@@ -169,6 +191,10 @@ BWAPI::Unit MicroDarkTemplar::getTarget(BWAPI::Unit meleeUnit, const BWAPI::Unit
 			score += 24;
 		}
 
+		if (target->getClosestUnit(BWAPI::Filter::IsEnemy && BWAPI::Filter::IsDetector, 7 * 32)) {
+			score -= 12 * 24;
+		}
+
 		if (score > bestScore)
 		{
 			bestScore = score;
@@ -191,7 +217,7 @@ int MicroDarkTemplar::getAttackPriority(BWAPI::Unit attacker, BWAPI::Unit target
     }
 
     if (targetType == BWAPI::UnitTypes::Protoss_Observatory ||
-        targetType == BWAPI::UnitTypes::Protoss_Robotics_Facility)
+        targetType == BWAPI::UnitTypes::Protoss_Robotics_Facility || BWAPI::UnitTypes::Protoss_Forge)
     {
         if (target->isCompleted())
         {
@@ -201,10 +227,100 @@ int MicroDarkTemplar::getAttackPriority(BWAPI::Unit attacker, BWAPI::Unit target
         return 11;
     }
 
-	if (targetType.isWorker())
+	if (targetType == BWAPI::UnitTypes::Protoss_High_Templar || targetType == BWAPI::UnitTypes::Protoss_Dark_Templar) {
+		return 11;
+	}
+
+	// Exceptions for dark templar.
+	if (attacker->getType() == BWAPI::UnitTypes::Protoss_Dark_Templar)
+	{
+		if (targetType == BWAPI::UnitTypes::Terran_Vulture_Spider_Mine)
+		{
+			return 10;
+		}
+		if ((targetType == BWAPI::UnitTypes::Terran_Missile_Turret || targetType == BWAPI::UnitTypes::Terran_Comsat_Station) &&
+			(BWAPI::Broodwar->self()->deadUnitCount(BWAPI::UnitTypes::Protoss_Dark_Templar) == 0))
+		{
+			return 9;
+		}
+		if (targetType == BWAPI::UnitTypes::Zerg_Spore_Colony)
+		{
+			return 8;
+		}
+		if (targetType.isWorker())
+		{
+			return 10;
+		}
+	}
+
+	// Short circuit: Enemy unit which is far enough outside its range is lower priority than a worker.
+	//短路:敌人的单位如果离它的射程足够远，优先级比一个工人低。
+	int enemyRange = UnitUtil::GetAttackRange(target, attacker);
+	if (enemyRange &&
+		!targetType.isWorker() &&
+		attacker->getDistance(target) > 32 + enemyRange)
+	{
+		return 8;
+	}
+	// Short circuit: Units before bunkers!
+	if (targetType == BWAPI::UnitTypes::Terran_Bunker)
+	{
+		return 10;
+	}
+	// Medics and ordinary combat units. Include workers that are doing stuff.
+	if (targetType == BWAPI::UnitTypes::Terran_Medic ||
+		targetType == BWAPI::UnitTypes::Protoss_High_Templar ||
+		targetType == BWAPI::UnitTypes::Protoss_Dark_Templar ||
+		targetType == BWAPI::UnitTypes::Protoss_Reaver ||
+		targetType == BWAPI::UnitTypes::Terran_Siege_Tank_Siege_Mode)
+	{
+		return 12;
+	}
+
+	if (targetType.groundWeapon() != BWAPI::WeaponTypes::None && !targetType.isWorker())
+	{
+		return 11;
+	}
+
+	if (targetType.isWorker() && (target->isRepairing() || target->isConstructing() || unitNearNarrowChokepoint(target)))
+	{
+		return 11;
+	}
+
+	// next priority is bored workers and turrets
+	if (targetType == BWAPI::UnitTypes::Terran_Missile_Turret)
 	{
 		return 9;
 	}
-	
+	// Buildings come under attack during free time, so they can be split into more levels.
+	// Nydus canal is critical.
+	if (targetType == BWAPI::UnitTypes::Zerg_Nydus_Canal)
+	{
+		return 10;
+	}
+	if (targetType == BWAPI::UnitTypes::Zerg_Spire)
+	{
+		return 6;
+	}
+	if (targetType == BWAPI::UnitTypes::Zerg_Spawning_Pool ||
+		targetType.isResourceDepot() ||
+		targetType == BWAPI::UnitTypes::Protoss_Templar_Archives ||
+		targetType.isSpellcaster())
+	{
+		return 5;
+	}
+	// Short circuit: Addons other than a completed comsat are worth almost nothing.
+	// TODO should also check that it is attached
+	if (targetType.isAddon() && !(targetType == BWAPI::UnitTypes::Terran_Comsat_Station && target->isCompleted()))
+	{
+		return 1;
+	}
+	// anything with a cost
+	if (targetType.gasPrice() > 0)
+	{
+		return 3;
+	}
+
+	// then everything else
 	return 1;
 }

@@ -33,17 +33,25 @@ void StrategyManager::update()
     // Check if we should stop a rush
     if (_rushing)
     {
-        // Stop the rush when the enemy has 3 or more non-tier-1 combat units
+        // Stop the rush when the enemy has some non-tier-1 combat units or a flying building
         int nonTierOneCombatUnits = 0;
+        bool flyingBuilding = false;
         for (auto & unit : InformationManager::Instance().getUnitInfo(BWAPI::Broodwar->enemy()))
         {
+            if (unit.second.type.isBuilding() && unit.second.isFlying)
+            {
+                flyingBuilding = true;
+                break;
+            }
+
             if (unit.second.type.isBuilding()) continue;
             if (!UnitUtil::IsCombatUnit(unit.second.type)) continue;
             if (UnitUtil::IsTierOneCombatUnit(unit.second.type)) continue;
             nonTierOneCombatUnits++;
         }
 
-        if (nonTierOneCombatUnits >= 3)
+        if (flyingBuilding || nonTierOneCombatUnits >= 3 ||
+            (BWAPI::Broodwar->enemy()->getRace() == BWAPI::Races::Terran && nonTierOneCombatUnits > 0))
         {
             _rushing = false;
             if (BWAPI::Broodwar->enemy()->getRace() != BWAPI::Races::Zerg)
@@ -164,6 +172,7 @@ const MetaPairVector StrategyManager::getProtossBuildOrderGoal()
 	int numZealots = UnitUtil::GetAllUnitCount(BWAPI::UnitTypes::Protoss_Zealot);
 	int numDragoons = UnitUtil::GetAllUnitCount(BWAPI::UnitTypes::Protoss_Dragoon);
 	int numDarkTemplar = UnitUtil::GetAllUnitCount(BWAPI::UnitTypes::Protoss_Dark_Templar);
+	int numHighTemplar = UnitUtil::GetAllUnitCount(BWAPI::UnitTypes::Protoss_High_Templar);
 	int numReavers = UnitUtil::GetAllUnitCount(BWAPI::UnitTypes::Protoss_Reaver);
 	int numCorsairs = UnitUtil::GetAllUnitCount(BWAPI::UnitTypes::Protoss_Corsair);
 	int numCarriers = UnitUtil::GetAllUnitCount(BWAPI::UnitTypes::Protoss_Carrier);
@@ -195,19 +204,19 @@ const MetaPairVector StrategyManager::getProtossBuildOrderGoal()
                 numForges++;
 
 			if (unit->getType() == BWAPI::UnitTypes::Protoss_Gateway
-				&& unit->getRemainingTrainTime() < 48)
+				&& unit->getRemainingTrainTime() < 12)
 				idleGateways++;
 			else if (unit->getType() == BWAPI::UnitTypes::Protoss_Stargate
-				&& unit->getRemainingTrainTime() < 48)
+				&& unit->getRemainingTrainTime() < 12)
 				idleStargates++;
 			else if (unit->getType() == BWAPI::UnitTypes::Protoss_Robotics_Facility
-				&& unit->getRemainingTrainTime() < 48)
+				&& unit->getRemainingTrainTime() < 12)
 				idleRoboFacilities++;
 			else if (unit->getType() == BWAPI::UnitTypes::Protoss_Forge
-				&& unit->getRemainingUpgradeTime() < 48)
+				&& unit->getRemainingUpgradeTime() < 12)
 				idleForges++;
 			else if (unit->getType() == BWAPI::UnitTypes::Protoss_Cybernetics_Core
-				&& unit->getRemainingUpgradeTime() < 48)
+				&& unit->getRemainingUpgradeTime() < 12)
                 idleCyberCores++;
 		}
 
@@ -263,11 +272,30 @@ const MetaPairVector StrategyManager::getProtossBuildOrderGoal()
 		zealotRatio = 1.0;
         if (BWAPI::Broodwar->enemy()->getRace() == BWAPI::Races::Zerg)
             getZealotSpeed = true;
-    }
+
+		if (numZealots >= 8 && numGateways >= 3) {
+			_openingGroup = "dragoons";
+		}
+	}
 	else if (_openingGroup == "dragoons" || _openingGroup == "drop")
 	{
 		getGoonRange = true;
 		goonRatio = 1.0;
+
+		if (numDarkTemplar >= 4) {
+			_openingGroup = "dragoons";
+		}
+
+		/*
+		if (_enemyRace == BWAPI::Races::Terran && numNexusCompleted >= 3 && !CombatCommander::Instance().onTheDefensive() && numCarriers < 8) {
+			_openingGroup = "carriers";
+		}
+		*/
+
+		if (numNexusCompleted > 4) {
+			_openingGroup = "carriers";
+		}
+
 	}
     else if (_openingGroup == "dark templar")
     {
@@ -275,7 +303,12 @@ const MetaPairVector StrategyManager::getProtossBuildOrderGoal()
         goonRatio = 1.0;
 
         // We use dark templar primarily for harassment, so don't build too many of them
-        if (numDarkTemplar < 8) buildDarkTemplar = true;
+        if (numDarkTemplar < 5) buildDarkTemplar = true;
+
+		if (InformationManager::Instance().enemyHasMobileDetection()) {
+			_openingGroup = "dragoons";
+			buildDarkTemplar = false;
+		}
     }
     else if (_openingGroup == "carriers")
     {
@@ -294,6 +327,10 @@ const MetaPairVector StrategyManager::getProtossBuildOrderGoal()
             buildGround = true;
             zealotRatio = 1.0; // Will be switched to goons below when the enemy gets air units, which is fine
         }
+
+		if (numCarriers >= 4) {
+			_openingGroup = "dragoons";
+		}
     }
 	else
 	{
@@ -313,22 +350,30 @@ const MetaPairVector StrategyManager::getProtossBuildOrderGoal()
         }
 
         // Mix in speedlots if the enemy has siege tanks
+		//如果敌人有攻城坦克，混合使用高速公路
         if (InformationManager::Instance().enemyHasSiegeTech())
         {
             getZealotSpeed = true;
 
-            // Keep the zealot:goon ratio at about 1:1, but keep training both
-            if (numZealots < numDragoons)
+            // Vary the ratio depending on how many tanks the enemy has
+            int tanks = 0;
+            for (const auto & ui : InformationManager::Instance().getUnitInfo(BWAPI::Broodwar->enemy()))
+                if (ui.second.type == BWAPI::UnitTypes::Terran_Siege_Tank_Siege_Mode ||
+                    ui.second.type == BWAPI::UnitTypes::Terran_Siege_Tank_Tank_Mode) tanks++;
+
+            // Scales from 1:1 to 3:1
+            double desiredZealotRatio = 0.5 + std::min((double)tanks / 40.0, 0.25);
+            double actualZealotRatio = numDragoons == 0 ? 1.0 : (double)numZealots / (double)numDragoons;
+            if (desiredZealotRatio > actualZealotRatio)
             {
-                zealotRatio = 0.7;
-                goonRatio = 0.3;
-            }
-            else
-            {
-                zealotRatio = 0.3;
-                goonRatio = 0.7;
+                zealotRatio = 1.0;
+                goonRatio = 0.0;
             }
         }
+
+		if (numNexusCompleted >= 2 && numZealots >= 4 && UnitUtil::GetCompletedUnitCount(BWAPI::UnitTypes::Protoss_Citadel_of_Adun) > 0) {
+			getZealotSpeed = true;
+		}
 
         // If we are currently gas blocked, train some zealots
         if (zealotRatio < 0.5 && idleGateways > 2 && self->gas() < 400 && self->minerals() > 700 && self->minerals() > self->gas() * 3)
@@ -340,11 +385,13 @@ const MetaPairVector StrategyManager::getProtossBuildOrderGoal()
         }
 
         // After getting third and a large army, build a fixed number of DTs unless many are dying
+        /*
         if ((numZealots + numDragoons) > 20
             && numNexusAll >= 3
             && self->deadUnitCount(BWAPI::UnitTypes::Protoss_Dark_Templar) < 3
             && numDarkTemplar < 3)
             buildDarkTemplar = true;
+        */
 
         // If we don't have a cyber core, only build zealots
         if (UnitUtil::GetCompletedUnitCount(BWAPI::UnitTypes::Protoss_Cybernetics_Core) == 0)
@@ -353,9 +400,14 @@ const MetaPairVector StrategyManager::getProtossBuildOrderGoal()
             goonRatio = 0.0;
         }
 
-        // Upgrade when we have at least two bases, a reasonable army size, our gateways are busy, and we aren't on the defensive
+        // Upgrade when appropriate:
+        // - we have at least two bases
+        // - we have a reasonable army size
+        // - we aren't on the defensive
+        // - our gateways are busy or we have a large income or we are close to maxed
         upgradeGround = numNexusCompleted >= 2 && (numZealots + numDragoons) >= 10 &&
-            ((numGateways - idleGateways) > 3 || gatewaySaturation > 0.75) && !CombatCommander::Instance().onTheDefensive();
+            ((numGateways - idleGateways) > 3 || gatewaySaturation > 0.75 || WorkerManager::Instance().getNumMineralWorkers() > 50 || BWAPI::Broodwar->self()->supplyUsed() >= 300)
+            && !CombatCommander::Instance().onTheDefensive();
     }
 
     // If we're trying to do anything that requires gas, make sure we have an assimilator
@@ -369,7 +421,9 @@ const MetaPairVector StrategyManager::getProtossBuildOrderGoal()
 
 	// Build reavers when we have 2 or more bases
 	// Disabled until we can micro reavers better
-	//if (numNexusAll >= 2) buildReaver = true;
+	if (_enemyRace != BWAPI::Races::Terran) {
+		if (numNexusCompleted >= 2 && numDragoons > 16) buildReaver = true;
+	}
 
 	if (getGoonRange)
 	{
@@ -409,7 +463,7 @@ const MetaPairVector StrategyManager::getProtossBuildOrderGoal()
 
             // Get a second forge and a templar archives when we are on 3 or more bases
             // This will let us efficiently upgrade both weapons and armor to 3
-            if (numNexusCompleted >= 3)
+            if (numNexusCompleted >= 3 && numGateways >= 6)
             {
                 if (numForges < 2)
                 {
@@ -524,15 +578,28 @@ const MetaPairVector StrategyManager::getProtossBuildOrderGoal()
 	}
 
 	// Normal gateway units
-	if (buildGround && idleGateways > 0)
+	if ((buildGround || buildDarkTemplar || buildCarriers) && idleGateways > 0)
 	{
 		int zealots = std::round(zealotRatio * idleGateways);
+		if (self->gas() < 50 && self->minerals() > 100) {
+			zealots = 1;
+		}
+
+		if (numDragoons > 20 && numZealots < numDragoons * 2 / 3) {
+			zealots = 1;
+		}
+
 		int goons = idleGateways - zealots;
 
 		if (zealots > 0)
 			goal.push_back(MetaPair(BWAPI::UnitTypes::Protoss_Zealot, numZealots + zealots));
+
 		if (goons > 0)
 			goal.push_back(MetaPair(BWAPI::UnitTypes::Protoss_Dragoon, numDragoons + goons));
+
+		if (numDragoons > 20 && self->gas() > self->minerals() * 3 && self->gas() > 125 && startedTemplarArchives) {
+			goal.push_back(MetaPair(BWAPI::UnitTypes::Protoss_High_Templar, numHighTemplar + 1));
+		}
 	}
 
     // Corsairs
@@ -576,7 +643,7 @@ const MetaPairVector StrategyManager::getProtossBuildOrderGoal()
 		// Observers have first priority
 		if (buildObserver
 			&& idleRoboFacilities > 0
-			&& numObservers < 3
+			&& numObservers < 2
 			&& self->completedUnitCount(BWAPI::UnitTypes::Protoss_Observatory) > 0)
 		{
 			int observersToBuild = std::min(idleRoboFacilities, 3 - numObservers);
@@ -588,7 +655,7 @@ const MetaPairVector StrategyManager::getProtossBuildOrderGoal()
 		// Build reavers from the remaining idle robo facilities
 		if (buildReaver
 			&& idleRoboFacilities > 0
-			&& numReavers < 5
+			&& numReavers < 4
 			&& self->completedUnitCount(BWAPI::UnitTypes::Protoss_Robotics_Support_Bay) > 0)
 		{
 			goal.push_back(MetaPair(BWAPI::UnitTypes::Protoss_Reaver, std::max(3, numReavers + idleRoboFacilities)));
@@ -597,7 +664,7 @@ const MetaPairVector StrategyManager::getProtossBuildOrderGoal()
 
     // Queue a gateway if we have no idle gateways and enough minerals for it
     // If we queue too many, the production manager will cancel them
-    if (buildGround && idleGateways == 0 && self->minerals() >= 150)
+	if ((buildGround || buildDarkTemplar || buildCarriers) && idleGateways == 0 && self->minerals() >= 150)
     {
         goal.push_back(MetaPair(BWAPI::UnitTypes::Protoss_Gateway, numGateways + 1));
     }
@@ -606,7 +673,7 @@ const MetaPairVector StrategyManager::getProtossBuildOrderGoal()
     // If we queue too many, the production manager will cancel them
     if (buildCarriers && idleStargates == 0 &&
         self->minerals() >= BWAPI::UnitTypes::Protoss_Stargate.mineralPrice() &&
-        self->gas() >= BWAPI::UnitTypes::Protoss_Stargate.gasPrice())
+        self->gas() >= BWAPI::UnitTypes::Protoss_Stargate.gasPrice() && numStargates < numNexusCompleted / 2)
     {
         goal.push_back(MetaPair(BWAPI::UnitTypes::Protoss_Stargate, numStargates + 1));
     }
@@ -753,7 +820,7 @@ const MetaPairVector StrategyManager::getTerranBuildOrderGoal()
 				!self->isUpgrading(BWAPI::UpgradeTypes::Terran_Infantry_Weapons) &&
 				numVessels > 0)
 			{
-goal.push_back(std::pair<MacroAct, int>(BWAPI::UpgradeTypes::Terran_Infantry_Weapons, weaponsUps + 1));
+				goal.push_back(std::pair<MacroAct, int>(BWAPI::UpgradeTypes::Terran_Infantry_Weapons, weaponsUps + 1));
 			}
 		}
 
@@ -1072,7 +1139,7 @@ void SetWallCannons(BuildOrderQueue & queue, int numCannons)
     {
         // Ensure we have a forge
         QueueUrgentItem(BWAPI::UnitTypes::Protoss_Forge, queue);
-        if (UnitUtil::GetCompletedUnitCount(BWAPI::UnitTypes::Protoss_Forge) < 1) return;
+        if (UnitUtil::GetAllUnitCount(BWAPI::UnitTypes::Protoss_Forge) < 1) return;
 
         queue.queueAsHighestPriority(m);
     }
@@ -1212,6 +1279,8 @@ void StrategyManager::handleUrgentProductionIssues(BuildOrderQueue & queue)
 
 	// For all races, if we've just discovered that the enemy is going with a heavy macro opening,
 	// drop any static defense that our opening build order told us to make.
+	//对于所有的种族，如果我们刚刚发现敌人正在以一个沉重的宏打开，
+	//放弃任何静态防御，我们的开放建设秩序告诉我们做。
 	if (!ProductionManager::Instance().isOutOfBook() && !_openingStaticDefenseDropped)
 	{
 		// We're in the opening book and haven't dropped static defenses yet. Should we?
@@ -1311,40 +1380,49 @@ void StrategyManager::handleUrgentProductionIssues(BuildOrderQueue & queue)
         // The logic is:
         // - If we have seen a cloaked combat unit, we definitely need detection
         // - If our opponent model tells us they might soon get cloaked combat units, get
-        //   them unless we are currently scouting the enemy base and have seen no sign of cloak tech
+        //   them unless the opponent is terran or we are currently scouting the enemy base
+        //   and have seen no sign of cloak tech
 		if (InformationManager::Instance().enemyHasCloakedCombatUnits() ||
-            (OpponentModel::Instance().expectCloakedCombatUnitsSoon() && (
+            (BWAPI::Broodwar->enemy()->getRace() != BWAPI::Races::Terran && OpponentModel::Instance().expectCloakedCombatUnitsSoon() && (
                 !ScoutManager::Instance().eyesOnEnemyBase() || InformationManager::Instance().enemyHasMobileCloakTech())))
 		{
-			if (_selfRace == BWAPI::Races::Protoss &&
-                UnitUtil::GetCompletedUnitCount(BWAPI::UnitTypes::Protoss_Observer) == 0)
+			if (_selfRace == BWAPI::Races::Protoss)
 			{
-				// Get mobile detection once we are out of our opening book or deep into it
-                // Earlier it messes up the build order too much, as it requires so much gas
-				if ((ProductionManager::Instance().isOutOfBook() || BWAPI::Broodwar->getFrameCount() > 6000) 
-                    && UnitUtil::GetAllUnitCount(BWAPI::UnitTypes::Protoss_Observer) == 0)
-				{
-					QueueUrgentItem(BWAPI::UnitTypes::Protoss_Observer, queue);
-				}
+				if (UnitUtil::GetCompletedUnitCount(BWAPI::UnitTypes::Protoss_Observer) == 0) {
+					// Get mobile detection once we are out of our opening book or deep into it
+					// Earlier it messes up the build order too much, as it requires so much gas
+					if ((ProductionManager::Instance().isOutOfBook() || BWAPI::Broodwar->getFrameCount() > 6000)
+						&& UnitUtil::GetAllUnitCount(BWAPI::UnitTypes::Protoss_Observer) == 0)
+					{
+						QueueUrgentItem(BWAPI::UnitTypes::Protoss_Observer, queue);
+					}
 
-                // Ensure the wall has cannons
-                if (BuildingPlacer::Instance().getWall().exists())
-                {
-                    SetWallCannons(queue, 2);
-                }
-                else
-                {
-                    // Otherwise, put cannons at our most forward base
-                    BWTA::BaseLocation * natural = InformationManager::Instance().getMyNaturalLocation();
-                    if (natural && BWAPI::Broodwar->self() == InformationManager::Instance().getBaseOwner(natural))
-                    {
-                        EnsureCannonsAtBase(natural, 2, queue);
-                    }
-                    else
-                    {
-                        EnsureCannonsAtBase(InformationManager::Instance().getMyMainBaseLocation(), 2, queue);
-                    }
-                }
+					// Ensure the wall has cannons
+					if (BuildingPlacer::Instance().getWall().exists())
+					{
+						SetWallCannons(queue, 2);
+					}
+					else
+					{
+						// Otherwise, put cannons at our most forward base
+						BWTA::BaseLocation * natural = InformationManager::Instance().getMyNaturalLocation();
+						if (natural && BWAPI::Broodwar->self() == InformationManager::Instance().getBaseOwner(natural))
+						{
+							EnsureCannonsAtBase(natural, 2, queue);
+						}
+						else
+						{
+							EnsureCannonsAtBase(InformationManager::Instance().getMyMainBaseLocation(), 2, queue);
+						}
+					}
+
+					if (InformationManager::Instance().enemyHasCloakedCombatUnits() && BWAPI::Broodwar->getFrameCount() < 8 * 60 * 24) {
+						CombatCommander::Instance().setAggression(false);
+					}
+				}
+				else {
+					CombatCommander::Instance().setAggression(true);
+				}
 			}
 			else if (_selfRace == BWAPI::Races::Terran)
 			{
@@ -1468,7 +1546,7 @@ void StrategyManager::handleUrgentProductionIssues(BuildOrderQueue & queue)
                 {
                     // Build two cannons immediately if the opponent does fast rushes
                     // Otherwise, scale cannons up gradually to protect against unscouted heavy pressure
-                    if (frame > 5000)
+                    if (frame > 4500)
                         cannons = 3;
                     else if (frame > 4000 || OpponentModel::Instance().enemyCanFastRush())
                         cannons = 2;
@@ -1551,6 +1629,8 @@ void StrategyManager::handleMacroProduction(BuildOrderQueue & queue)
     // Don't do anything if we are in the opening book
     if (!ProductionManager::Instance().isOutOfBook()) return;
 
+	int frame = BWAPI::Broodwar->getFrameCount();
+
     // Only expand if we aren't on the defensive
     bool safeToMacro = !CombatCommander::Instance().onTheDefensive();
 
@@ -1592,11 +1672,33 @@ void StrategyManager::handleMacroProduction(BuildOrderQueue & queue)
         (mineralPatches < desiredMineralPatches || gasBlocked) &&
         !isRushing())
     {
+		bool skipThisItem = false;
+		int nexuses = UnitUtil::GetAllUnitCount(BWAPI::UnitTypes::Protoss_Nexus);
+
+		if (BWAPI::Broodwar->enemy()->getRace() == BWAPI::Races::Protoss) {
+			if (nexuses >= 1 && frame < 7 * 60 * 24) {
+				skipThisItem = true;
+			}
+		}
+
+		if (BWAPI::Broodwar->enemy()->getRace() != BWAPI::Races::Terran) {
+			if (nexuses >= 2 && frame < 9 * 60 * 24 && BWAPI::Broodwar->self()->minerals() < 800) {
+				skipThisItem = true;
+			}
+
+			if (nexuses >= 3 && frame < 13 * 60 * 24 && BWAPI::Broodwar->self()->minerals() < 600 && CombatCommander::Instance().getNumCombatUnit() < 100) {
+				skipThisItem = true;
+			}
+		}
+
         // Double-check that there is actually a place to expand to
-        if (MapTools::Instance().getNextExpansion(false, true, false) != BWAPI::TilePositions::None)
+		if (!skipThisItem && MapTools::Instance().getNextExpansion(false, true, false) != BWAPI::TilePositions::None)
         {
             Log().Get() << "Expanding: " << mineralPatches << " active mineral patches, " << probes << " probes, " << UnitUtil::GetAllUnitCount(BWAPI::UnitTypes::Protoss_Nexus) << " nexuses";
-            queue.queueAsLowestPriority(BWAPI::UnitTypes::Protoss_Nexus);
+            if (WorkerManager::Instance().isCollectingGas())
+                queue.queueAsLowestPriority(BWAPI::UnitTypes::Protoss_Nexus);
+            else
+                queue.queueAsLowestPriority(MacroAct(BWAPI::UnitTypes::Protoss_Nexus, MacroLocation::MinOnly));
         }
     }
 
@@ -1695,6 +1797,28 @@ void StrategyManager::handleMacroProduction(BuildOrderQueue & queue)
             if (totalQueued > 2) break;
         }
     }
+
+	//除敌人占领区个，都去造一个bc防守
+	if (BWAPI::Broodwar->getFrameCount() % (10 * 24) == 0 &&
+		safeToMacro &&
+		UnitUtil::GetCompletedUnitCount(BWAPI::UnitTypes::Protoss_Forge) > 0 &&
+		(UnitUtil::GetCompletedUnitCount(BWAPI::UnitTypes::Protoss_Nexus) >= 4 ||
+		BWAPI::Broodwar->self()->supplyUsed() > 300) && BWAPI::Broodwar->self()->minerals() > 400) {
+
+		int totalQueued = 0;
+
+		for (BWTA::BaseLocation * base : BWTA::getBaseLocations())
+		{
+			if (base == InformationManager::Instance().getEnemyMainBaseLocation() || base == InformationManager::Instance().getEnemyNaturalLocation()) continue;
+
+			if (InformationManager::Instance().getBase(base)->owner == _enemy) {
+				continue;
+			}
+
+			totalQueued += EnsureCannonsAtBase(base, 1, queue, true);
+			if (totalQueued > 1) break;
+		}
+	}
 }
 
 // Return true if we're supply blocked and should build supply.
@@ -1742,13 +1866,13 @@ bool StrategyManager::detectSupplyBlock(BuildOrderQueue & queue) const
 		}
 	}
 
-	// Count supply needed by the next 5 items in the queue
-	int supplyNeeded = 0;
-	for (int i = queue.size() - 1; i >= 0 && i >= queue.size() - 5; --i)
-		supplyNeeded += queue[i].macroAct.supplyRequired();
-
-	// Keep a buffer of 16 or 15% extra supply, whichever is higher
-	supplyNeeded += std::max(16, (int)std::ceil(supplyAvailable * 0.15));
+    // Roughly estimate that 6 mineral workers will support constant production from a gateway
+    // Then reserve enough supply to produce a unit out of each of these virtual gateways
+    // This is a very rough estimate and doesn't take into consideration anything else we are building
+    // At minimum keep a buffer of 16
+    int supplyNeeded = std::max(
+        (WorkerManager::Instance().getNumMineralWorkers() / 6) * 4,
+        16);
 
 	return supplyAvailable < supplyNeeded;
 }
@@ -1884,7 +2008,7 @@ bool StrategyManager::hasDropTech()
 	return false;
 }
 
-// Returns the percentage of our production facilities that are currently training something
+// Returns the percentage of our completed production facilities that are currently training something
 double StrategyManager::getProductionSaturation(BWAPI::UnitType producer) const
 {
     // Look up overall count and idle count
@@ -1896,7 +2020,7 @@ double StrategyManager::getProductionSaturation(BWAPI::UnitType producer) const
             && unit->isPowered())
         {
             numFacilities++;
-            if (unit->getRemainingTrainTime() < 48) idleFacilities++;
+            if (unit->getRemainingTrainTime() < 12) idleFacilities++;
         }
 
     if (numFacilities == 0) return 0.0;

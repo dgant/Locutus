@@ -2,9 +2,9 @@
 
 #include "ScoutManager.h"
 #include "UnitUtil.h"
+#include "MathUtil.h"
 #include "MapGrid.h"
-
-namespace { auto & bwemMap = BWEM::Map::Instance(); }
+#include "PathFinding.h"
 
 using namespace UAlbertaBot;
 
@@ -102,14 +102,16 @@ void Squad::update()
 			BWAPI::Broodwar->drawCircleMap(regroupPosition.x, regroupPosition.y, 20, BWAPI::Colors::Purple, true);
 		}
         
-        auto vanguard = unitClosestToEnemy();
+        auto vanguard = unitClosestToOrderPosition();
 
 		_microAirToAir.regroup(regroupPosition, vanguard, _nearEnemy);
 		_microMelee.regroup(regroupPosition, vanguard, _nearEnemy);
 		_microDarkTemplar.regroup(regroupPosition, vanguard, _nearEnemy);
 		_microRanged.regroup(regroupPosition, vanguard, _nearEnemy);
-        _microCarriers.regroup(regroupPosition, vanguard, _nearEnemy);
-		_microTanks.regroup(regroupPosition, vanguard, _nearEnemy);
+		_microCarriers.execute();
+        //_microCarriers.regroup(regroupPosition, vanguard, _nearEnemy);
+		//_microTanks.regroup(regroupPosition, vanguard, _nearEnemy);
+		_microDragoons.regroup(regroupPosition, vanguard, _nearEnemy);
 	}
 	else
 	{
@@ -119,7 +121,8 @@ void Squad::update()
 		_microDarkTemplar.execute();
 		_microRanged.execute();
         _microCarriers.execute();
-		_microTanks.execute();
+		//_microTanks.execute();
+		_microDragoons.execute();
 	}
 
     // Execute micro for bunker squads
@@ -130,7 +133,7 @@ void Squad::update()
 
 	// Lurkers never regroup, always execute their order.
 	// TODO It is because regrouping works poorly. It retreats and unburrows them too often.
-	_microLurkers.execute();
+	//_microLurkers.execute();
 
 	// Maybe stim marines and firebats.
 	stimIfNeeded();
@@ -138,7 +141,7 @@ void Squad::update()
 	// The remaining non-combat micro managers try to keep units near the front line.
 	if (BWAPI::Broodwar->getFrameCount() % 8 == 3)    // deliberately lag a little behind reality
 	{
-		BWAPI::Unit vanguard = unitClosestToEnemy();
+		BWAPI::Unit vanguard = unitClosestToOrderPosition();
 
 		// Medics.
 		BWAPI::Position medicGoal = vanguard && vanguard->getPosition().isValid() ? vanguard->getPosition() : calcCenter();
@@ -255,12 +258,16 @@ void Squad::addUnitsToMicroManagers()
 	BWAPI::Unitset lurkerUnits;
     BWAPI::Unitset tankUnits;
     BWAPI::Unitset medicUnits;
+	BWAPI::Unitset dragoonUnits;
 
 	for (const auto unit : _units)
 	{
 		if (unit->isCompleted() && unit->exists() && unit->getHitPoints() > 0 && !unit->isLoaded())
 		{
-			if (unit->getType() == BWAPI::UnitTypes::Terran_Valkyrie ||
+			if (unit->getType() == BWAPI::UnitTypes::Protoss_Dragoon) {
+				dragoonUnits.insert(unit);
+			}
+			else if (unit->getType() == BWAPI::UnitTypes::Terran_Valkyrie ||
 				unit->getType() == BWAPI::UnitTypes::Protoss_Corsair ||
 				unit->getType() == BWAPI::UnitTypes::Zerg_Devourer)
 			{
@@ -333,10 +340,11 @@ void Squad::addUnitsToMicroManagers()
 	_microDetectors.setUnits(detectorUnits);
 	_microDarkTemplar.setUnits(darkTemplarUnits);
 	_microHighTemplar.setUnits(highTemplarUnits);
-	_microLurkers.setUnits(lurkerUnits);
-	_microMedics.setUnits(medicUnits);
-	_microTanks.setUnits(tankUnits);
+	//_microLurkers.setUnits(lurkerUnits);
+	//_microMedics.setUnits(medicUnits);
+	//_microTanks.setUnits(tankUnits);
 	_microTransports.setUnits(transportUnits);
+	_microDragoons.setUnits(dragoonUnits);
 }
 
 // Calculates whether to regroup, aka retreat. Does combat sim if necessary.
@@ -357,7 +365,7 @@ bool Squad::needsToRegroup()
 	}
 
 	// If we're nearly maxed and have good income or cash, don't retreat.
-	if (BWAPI::Broodwar->self()->supplyUsed() >= 390 &&
+	if (BWAPI::Broodwar->self()->supplyUsed() >= 380 &&
 		(BWAPI::Broodwar->self()->minerals() > 1000 || WorkerManager::Instance().getNumMineralWorkers() > 12))
 	{
 		_attackAtMax = true;
@@ -365,7 +373,7 @@ bool Squad::needsToRegroup()
 
 	if (_attackAtMax)
 	{
-		if (BWAPI::Broodwar->self()->supplyUsed() < 320)
+		if (BWAPI::Broodwar->self()->supplyUsed() < 360)
 		{
 			_attackAtMax = false;
 		}
@@ -376,42 +384,25 @@ bool Squad::needsToRegroup()
 		}
 	}
 
-	BWAPI::Unit unitClosest = unitClosestToEnemy();
-
-	if (!unitClosest)
-	{
-		_regroupStatus = std::string("No closest unit");
-		return false;
-	}
-
     // Don't retreat if we are actively doing a run-by
     // TODO: Split the run-by units into their own squad
     for (auto & unit : _units)
-        if (getBunkerRunBySquad(unit))
+    {
+        auto bunkerRunBySquad = getBunkerRunBySquad(unit);
+        if (bunkerRunBySquad && bunkerRunBySquad->isPerformingRunBy(unit))
             return false;
+    }
 
 	// If we most recently retreated, don't attack again until retreatDuration frames have passed.
+	//如果我们最近一次撤退，在撤退持续时间结束之前不要再进攻。
 	const int retreatDuration = 2 * 24;
 	bool retreat = _lastRetreatSwitchVal && (BWAPI::Broodwar->getFrameCount() - _lastRetreatSwitch < retreatDuration);
 
 	if (!retreat)
 	{
         // All other checks are done. Finally do the expensive combat simulation.
-
-        // If we retreated last time, simulate around a point closer to the order position
-        // Otherwise simulate around the closest unit
-        BWAPI::Position simPosition(unitClosest->getPosition());
-        if (_lastRetreatSwitchVal)
-        {
-            BWAPI::Position delta(_order.getPosition() - simPosition);
-            double a = atan2(delta.y, delta.x);
-
-            simPosition = BWAPI::Position(
-                simPosition.x + (int)std::round(96 * std::cos(a)),
-                simPosition.y + (int)std::round(96 * std::sin(a)));
-        }
-
-        double score = runCombatSim(simPosition);
+		//所有其他检查都完成了。最后做昂贵的战斗模拟。
+        int score = runCombatSim(_order.getPosition());
 
 		retreat = score < 0;
 		_lastRetreatSwitch = BWAPI::Broodwar->getFrameCount();
@@ -538,10 +529,22 @@ BWAPI::Position Squad::calcRegroupPosition()
 		// Count combat units only. Bug fix originally thanks to AIL, it's been rewritten a bit since then.
 		if (!_nearEnemy[unit] &&
 			!unit->getType().isDetector() &&
+			!unit->getType().isFlyer() &&
 			unit->getType() != BWAPI::UnitTypes::Terran_Medic &&
 			unit->getPosition().isValid())    // excludes loaded units
 		{
 			int dist = unit->getDistance(_order.getPosition());
+
+			/*
+			if (unit->getType() == BWAPI::UnitTypes::Protoss_Dark_Templar) {
+				dist -= 6 * 32;
+			}
+
+			if (unit->getType() == BWAPI::UnitTypes::Protoss_Reaver) {
+				dist -= 10 * 32;
+			}
+			*/
+
 			if (dist < minDist)
 			{
 				// If the squad has any ground units, don't try to retreat to the position of an air unit
@@ -565,26 +568,33 @@ BWAPI::Position Squad::calcRegroupPosition()
 		BWTA::BaseLocation * natural = InformationManager::Instance().getMyNaturalLocation();
 		if (natural && InformationManager::Instance().getBaseOwner(natural) == BWAPI::Broodwar->self())
 		{
-			// If we have a wall, use its door location
-			if (BuildingPlacer::Instance().getWall().exists())
-				regroup = BuildingPlacer::Instance().getWall().gapCenter;
-			else
-				regroup = BWTA::getRegion(natural->getTilePosition())->getCenter();
+			regroup = BWTA::getRegion(natural->getTilePosition())->getCenter();
 		}
+
+		// If we have a wall, use its door location
+		//如果我们有一堵墙，使用它的门位置
+		if (BuildingPlacer::Instance().getWall().exists())
+			regroup = BuildingPlacer::Instance().getWall().gapCenter;
+
 	}
 
 	return regroup;
 }
 
-// Return the unit closest to the order position (not actually closest to the enemy).
-BWAPI::Unit Squad::unitClosestToEnemy()
+BWAPI::Unit Squad::unitClosestToOrderPosition() const
+{
+    return unitClosestTo(_order.getPosition());
+}
+
+// Return the unit closest to the order position
+BWAPI::Unit Squad::unitClosestTo(BWAPI::Position position, bool debug) const
 {
 	BWAPI::Unit closest = nullptr;
-	int closestDist = 100000;
+	int closestDist = INT_MAX;
 
-	UAB_ASSERT(_order.getPosition().isValid(), "bad order position");
+	UAB_ASSERT(position.isValid(), "bad position");
 
-	for (const auto unit : _units)
+	for (auto unit : _units)
 	{
 		// Non-combat units should be ignored for this calculation.
 		if (unit->getType().isDetector() ||
@@ -598,14 +608,13 @@ BWAPI::Unit Squad::unitClosestToEnemy()
 		if (_hasGround)
 		{
 			// A ground or air-ground squad. Use ground distance.
-			// It is -1 if no ground path exists.
-			dist = MapTools::Instance().getGroundDistance(unit->getPosition(), _order.getPosition());
+            dist = PathFinding::GetGroundDistance(unit->getPosition(), position);
 		}
 		else
 		{
 			// An all-air squad. Use air distance (which is what unit->getDistance() gives).
-			dist = unit->getDistance(_order.getPosition());
-		}
+			dist = unit->getDistance(position);
+        }
 
 		if (dist < closestDist && dist != -1)
 		{
@@ -635,14 +644,15 @@ void Squad::setSquadOrder(const SquadOrder & so)
 	// Pass the order on to all micromanagers.
 	_microAirToAir.setOrder(so);
 	_microMelee.setOrder(so);
+	_microDragoons.setOrder(so);
 	_microRanged.setOrder(so);
     _microCarriers.setOrder(so);
 	_microDetectors.setOrder(so);
 	_microDarkTemplar.setOrder(so);
 	_microHighTemplar.setOrder(so);
-	_microLurkers.setOrder(so);
-	_microMedics.setOrder(so);
-	_microTanks.setOrder(so);
+	//_microLurkers.setOrder(so);
+	//_microMedics.setOrder(so);
+	//_microTanks.setOrder(so);
 	_microTransports.setOrder(so);
 }
 
@@ -775,6 +785,7 @@ void Squad::stimIfNeeded()
 	}
 
 	// Next marines, treated the same except for range and hit points.
+	//下一个陆战队员，除了射程和生命值之外，都受到相同的待遇。
 	for (const auto marine : _microRanged.getUnits())
 	{
 		// Invalid position means the marine is probably in a bunker or transport.
@@ -799,52 +810,125 @@ void Squad::stimIfNeeded()
 	}
 }
 
-void Squad::addUnitToBunkerAttackSquad(BWAPI::Unit bunker, BWAPI::Unit unit)
+void Squad::addUnitToBunkerAttackSquad(BWAPI::Position bunkerPosition, BWAPI::Unit unit)
 {
-    bunkerAttackSquads[bunker].addUnit(bunker, unit);
+    bunkerAttackSquads[bunkerPosition].addUnit(bunkerPosition, unit);
+}
+
+bool Squad::addUnitToBunkerAttackSquadIfClose(BWAPI::Unit unit)
+{
+    if (unit->isFlying()) return false;
+
+    int distToOrderPosition = unit->getDistance(_order.getPosition());
+
+    for (auto & ui : InformationManager::Instance().getUnitInfo(BWAPI::Broodwar->enemy()))
+    {
+        if (ui.second.type != BWAPI::UnitTypes::Terran_Bunker) continue;
+        if (ui.second.goneFromLastPosition) continue;
+        if (!ui.second.completed && ui.second.estimatedCompletionFrame > BWAPI::Broodwar->getFrameCount()) continue;
+        if (unit->getDistance(ui.second.lastPosition) > 1000) continue;
+
+        int unitDist = PathFinding::GetGroundDistance(unit->getPosition(), _order.getPosition());
+        int bunkerDist = PathFinding::GetGroundDistance(ui.second.lastPosition, _order.getPosition());
+        if (unitDist != -1 && bunkerDist != -1 && unitDist > (bunkerDist - 128))
+        {
+            bunkerAttackSquads[ui.second.lastPosition].addUnit(ui.second.lastPosition, unit);
+            return true;
+        }
+    }
+
+    return false;
 }
 
 MicroBunkerAttackSquad * Squad::getBunkerRunBySquad(BWAPI::Unit unit)
 {
     for (auto& pair : bunkerAttackSquads)
-        if (pair.second.isPerformingRunBy(unit))
+        if (pair.second.isPerformingRunBy(unit) || pair.second.hasPerformedRunBy(unit))
             return &pair.second;
     return nullptr;
 }
 
-double Squad::runCombatSim(BWAPI::Position center)
+int Squad::runCombatSim(BWAPI::Position targetPosition)
 {
+    // Get our "vanguard unit"
+    BWAPI::Unit ourVanguard = unitClosestTo(targetPosition, true);
+    if (!ourVanguard) return 1; // We have no units
+
+    // Get the enemy "vanguard unit"
+    int closestDist = INT_MAX;
+    BWAPI::Position enemyVanguard = BWAPI::Positions::Invalid;
+    for (const auto & ui : InformationManager::Instance().getUnitInfo(BWAPI::Broodwar->enemy()))
+    {
+        if (ui.second.goneFromLastPosition) continue;
+        int dist = ui.second.isFlying || ourVanguard->isFlying()
+            ? ui.second.lastPosition.getApproxDistance(ourVanguard->getPosition())
+            : PathFinding::GetGroundDistance(ui.second.lastPosition, ourVanguard->getPosition());
+        if (dist < closestDist && dist != -1)
+        {
+            closestDist = dist;
+            enemyVanguard = ui.second.lastPosition;
+        }
+    }
+    if (!enemyVanguard.isValid()) return 1; // Enemy has no units
+
     // Special case: ignore enemy bunkers if:
     // - Our squad is entirely ranged goons
     // - The enemy doesn't have the marine range upgrade
-    // - None of our goons are currently in range of an enemy bunker
-    
+    // - The enemy doesn't have any other units in the combat sim radius
+    // - None of our goons are moving into range of an enemy bunker (unless they are in a bunker attack squad)
     bool ignoreBunkers = 
         BWAPI::Broodwar->self()->getUpgradeLevel(BWAPI::UpgradeTypes::Singularity_Charge) &&
         !InformationManager::Instance().enemyHasInfantryRangeUpgrade();
     if (ignoreBunkers)
     {
-        // Gather enemy bunker positions
-        std::vector<BWAPI::Unit> bunkers;
-        for (auto unit : BWAPI::Broodwar->enemy()->getUnits())
+        // Gather enemy bunker positions and break if the enemy has other units
+        std::vector<BWAPI::Position> bunkers;
+        for (auto const & ui : InformationManager::Instance().getUnitInfo(BWAPI::Broodwar->enemy()))
         {
-            if (unit->getType() == BWAPI::UnitTypes::Terran_Bunker) bunkers.push_back(unit);
+            if (UnitUtil::IsCombatUnit(ui.second.type) && ui.second.type != BWAPI::UnitTypes::Terran_Bunker &&
+                !ui.second.goneFromLastPosition && ui.second.lastPosition.getApproxDistance(enemyVanguard) < _combatSimRadius)
+            {
+                ignoreBunkers = false;
+                goto breakBunkerCheck;
+            }
+
+            if (ui.second.type == BWAPI::UnitTypes::Terran_Bunker &&
+                !ui.second.goneFromLastPosition)
+            {
+                bunkers.push_back(ui.second.lastPosition);
+            }
         }
         if (!bunkers.empty())
         {
             // Make sure all of our units are goons and out of range of the bunker
             for (auto & unit : _units)
             {
+                // If the unit is part of a bunker attack squad, all is well
+                // They are allowed to move through the attack range of the bunker
+				//如果该部队是碉堡攻击小队的一员，一切都很好
+				//允许他们通过掩体的攻击范围
+                if (getBunkerRunBySquad(unit)) continue;
+
                 if (unit->getType() != BWAPI::UnitTypes::Protoss_Dragoon)
                 {
+                    Log().Debug() << "Not ignoring bunker; have a non-goon";
                     ignoreBunkers = false;
                     goto breakBunkerCheck;
                 }
 
-                for (auto bunker : bunkers)
+                BWAPI::Position anticipatedDragoonPosition = 
+                    InformationManager::Instance().predictUnitPosition(unit, BWAPI::Broodwar->getLatencyFrames());
+
+                for (auto bunkerPosition : bunkers)
                 {
-                    if (bunker->getDistance(unit) <= (5 * 32))
+                    if (MathUtil::EdgeToEdgeDistance(
+                            BWAPI::UnitTypes::Protoss_Dragoon, 
+                            anticipatedDragoonPosition, 
+                            BWAPI::UnitTypes::Terran_Bunker, 
+                            bunkerPosition) <= ((5 * 32) + 1))
                     {
+                        Log().Debug() << "Not ignoring bunker; have a goon entering bunker range";
+
                         ignoreBunkers = false;
                         goto breakBunkerCheck;
                     }
@@ -857,7 +941,7 @@ double Squad::runCombatSim(BWAPI::Position center)
     int radius = _combatSimRadius;
     if (StrategyManager::Instance().isRushing()) radius /= 2;
 
-    sim.setCombatUnits(center, radius, _fightVisibleOnly, ignoreBunkers);
+    sim.setCombatUnits(ourVanguard->getPosition(), enemyVanguard, radius, _fightVisibleOnly, ignoreBunkers);
     return sim.simulateCombat(_lastRetreatSwitchVal);
 }
 
@@ -897,7 +981,7 @@ const bool Squad::isOverlordHunterSquad() const
 	return true;
 }
 
-bool Squad::hasMicroManager(MicroManager* microManager) const
+bool Squad::hasMicroManager(const MicroManager* microManager) const
 {
     return
         &_microAirToAir == microManager ||
@@ -909,6 +993,7 @@ bool Squad::hasMicroManager(MicroManager* microManager) const
         &_microMedics == microManager ||
         &_microMelee == microManager ||
         &_microRanged == microManager ||
+		&_microDragoons == microManager ||
         &_microTanks == microManager ||
         &_microTransports == microManager;
 }

@@ -1,5 +1,9 @@
 #include "FAP.h"
 #include "BWAPI.h"
+#include "InformationManager.h"
+#include "MathUtil.h"
+#include "Logger.h"
+#include "Random.h"
 
 UAlbertaBot::FastAPproximation fap;
 
@@ -8,7 +12,14 @@ UAlbertaBot::FastAPproximation fap;
 
 namespace UAlbertaBot {
 
-    FastAPproximation::FastAPproximation() {}
+    FastAPproximation::FastAPproximation() {
+#ifdef FAP_DEBUG
+        std::ostringstream filename;
+        filename << "bwapi-data/write/combatsim-" << Random::Instance().index(10000) << ".csv";
+        debug.open(filename.str());
+        debug << "bwapi frame;sim frame;self;unit type;unit id;score;x;y;health;shields;cooldown;target type;target id;target x;target y;target dist;action;new x;new y";
+#endif
+    }
 
     void FastAPproximation::addUnitPlayer1(FAPUnit fu) { player1.push_back(fu); }
 
@@ -36,6 +47,7 @@ namespace UAlbertaBot {
             didSomething = false;
 
             isimulate();
+            frame++;
 
             if (!didSomething)
                 break;
@@ -44,7 +56,7 @@ namespace UAlbertaBot {
 
     const auto score = [](const FastAPproximation::FAPUnit &fu) {
         if (fu.health && fu.maxHealth)
-            return ((fu.score * fu.health) / (fu.maxHealth * 2)) +
+            return ((fu.score * (fu.health * 3 + fu.shields) + fu.score) / (fu.maxHealth * 3 + fu.maxShields)) +
             (fu.unitType == BWAPI::UnitTypes::Terran_Bunker) *
             BWAPI::UnitTypes::Terran_Marine.destroyScore() * 4;
         return 0;
@@ -96,7 +108,12 @@ namespace UAlbertaBot {
         return { &player1, &player2 };
     }
 
-    void FastAPproximation::clearState() { player1.clear(), player2.clear(); }
+    void FastAPproximation::clearState() {
+        player1.clear(), player2.clear(), frame = 0;
+#ifdef FAP_DEBUG
+        debug.flush();
+#endif
+    }
 
     void FastAPproximation::dealDamage(const FastAPproximation::FAPUnit &fu,
         int damage,
@@ -133,10 +150,10 @@ namespace UAlbertaBot {
         fu.health -= std::max(128, damage);
     }
 
-    int inline FastAPproximation::distButNotReally(
+    int inline FastAPproximation::distance(
         const FastAPproximation::FAPUnit &u1,
         const FastAPproximation::FAPUnit &u2) const {
-        return (u1.x - u2.x) * (u1.x - u2.x) + (u1.y - u2.y) * (u1.y - u2.y);
+        return MathUtil::EdgeToEdgeDistance(u1.unitType, BWAPI::Position(u1.x, u1.y), u2.unitType, BWAPI::Position(u2.x, u2.y));
     }
 
     bool FastAPproximation::isSuicideUnit(BWAPI::UnitType ut) {
@@ -149,9 +166,28 @@ namespace UAlbertaBot {
     void FastAPproximation::unitsim(
         const FastAPproximation::FAPUnit &fu,
         std::vector<FastAPproximation::FAPUnit> &enemyUnits) {
+
+#ifdef FAP_DEBUG
+        debug << "\n" << BWAPI::Broodwar->getFrameCount() << ";" << frame << ";" << (fu.player==BWAPI::Broodwar->self()) << ";" << fu.unitType << ";" << fu.id << ";" << score(fu) << ";" << fu.x << ";" << fu.y << ";" << fu.health << ";" << fu.shields << ";" << fu.attackCooldownRemaining;
+#endif
+
+        bool kite = false;
         if (fu.attackCooldownRemaining) {
-            didSomething = true;
-            return;
+            if (fu.unitType == BWAPI::UnitTypes::Terran_Vulture ||
+                (fu.unitType == BWAPI::UnitTypes::Protoss_Dragoon &&
+                fu.attackCooldownRemaining <= BWAPI::UnitTypes::Protoss_Dragoon.groundWeapon().damageCooldown() - 9))
+            {
+                kite = true;
+            }
+
+            if (!kite)
+            {
+#ifdef FAP_DEBUG
+                debug << ";;;;;;;;";
+#endif
+                didSomething = true;
+                return;
+            }
         }
 
         auto closestEnemy = enemyUnits.end();
@@ -161,7 +197,7 @@ namespace UAlbertaBot {
             ++enemyIt) {
             if (enemyIt->flying) {
                 if (fu.airDamage) {
-                    int d = distButNotReally(fu, *enemyIt);
+                    int d = distance(fu, *enemyIt);
                     if ((closestEnemy == enemyUnits.end() || d < closestDist) &&
                         d >= fu.airMinRange) {
                         closestDist = d;
@@ -171,7 +207,7 @@ namespace UAlbertaBot {
             }
             else {
                 if (fu.groundDamage) {
-                    int d = distButNotReally(fu, *enemyIt);
+                    int d = distance(fu, *enemyIt);
                     if ((closestEnemy == enemyUnits.end() || d < closestDist) &&
                         d >= fu.groundMinRange) {
                         closestDist = d;
@@ -181,7 +217,38 @@ namespace UAlbertaBot {
             }
         }
 
-        if (closestEnemy != enemyUnits.end() && sqrt(closestDist) <= fu.speed &&
+#ifdef FAP_DEBUG
+        if (closestEnemy != enemyUnits.end())
+            debug << ";" << closestEnemy->unitType << ";" << closestEnemy->id << ";" << closestEnemy->x << ";" << closestEnemy->y << ";" << closestDist;
+        else
+            debug << ";;;;;";
+#endif
+
+        if (kite)
+        {
+            if (closestEnemy != enemyUnits.end() &&
+                closestEnemy->groundMaxRange < fu.groundMaxRange &&
+                closestDist <= (fu.groundMaxRange + fu.speed))
+            {
+                int dx = closestEnemy->x - fu.x, dy = closestEnemy->y - fu.y;
+
+                fu.x -= (int)(dx * (fu.speed / sqrt(dx * dx + dy * dy)));
+                fu.y -= (int)(dy * (fu.speed / sqrt(dx * dx + dy * dy)));
+
+#ifdef FAP_DEBUG
+                debug << ";kite;" << fu.x << ";" << fu.y;
+#endif
+            }
+#ifdef FAP_DEBUG
+            else
+                debug << ";idle;" << fu.x << ";" << fu.y;
+#endif
+
+            didSomething = true;
+            return;
+        }
+
+        if (closestEnemy != enemyUnits.end() && closestDist <= fu.speed &&
             !(fu.x == closestEnemy->x && fu.y == closestEnemy->y)) {
             fu.x = closestEnemy->x;
             fu.y = closestEnemy->y;
@@ -192,7 +259,7 @@ namespace UAlbertaBot {
 
         if (closestEnemy != enemyUnits.end() &&
             closestDist <=
-            (closestEnemy->flying ? fu.groundMaxRange : fu.airMinRange)) {
+            (closestEnemy->flying ? fu.airMaxRange : fu.groundMaxRange)) {
             if (closestEnemy->flying)
                 dealDamage(*closestEnemy, fu.airDamage, fu.airDamageType),
                 fu.attackCooldownRemaining = fu.airCooldown;
@@ -211,18 +278,30 @@ namespace UAlbertaBot {
                 unitDeath(temp, enemyUnits);
             }
 
+#ifdef FAP_DEBUG
+            debug << ";attack;" << fu.x << ";" << fu.y;
+#endif
+
             didSomething = true;
             return;
         }
-        else if (closestEnemy != enemyUnits.end() && sqrt(closestDist) > fu.speed) {
+        else if (closestEnemy != enemyUnits.end() && closestDist > fu.speed) {
             int dx = closestEnemy->x - fu.x, dy = closestEnemy->y - fu.y;
 
             fu.x += (int)(dx * (fu.speed / sqrt(dx * dx + dy * dy)));
             fu.y += (int)(dy * (fu.speed / sqrt(dx * dx + dy * dy)));
 
+#ifdef FAP_DEBUG
+            debug << ";move;" << fu.x << ";" << fu.y;
+#endif
+
             didSomething = true;
             return;
         }
+
+#ifdef FAP_DEBUG
+        debug << ";idle;" << fu.x << ";" << fu.y;
+#endif
     }
 
     void FastAPproximation::medicsim(const FAPUnit &fu,
@@ -232,7 +311,7 @@ namespace UAlbertaBot {
 
         for (auto it = friendlyUnits.begin(); it != friendlyUnits.end(); ++it) {
             if (it->isOrganic && it->health < it->maxHealth && !it->didHealThisFrame) {
-                int d = distButNotReally(fu, *it);
+                int d = distance(fu, *it);
                 if (closestHealable == friendlyUnits.end() || d < closestDist) {
                     closestHealable = it;
                     closestDist = d;
@@ -262,7 +341,7 @@ namespace UAlbertaBot {
             ++enemyIt) {
             if (enemyIt->flying) {
                 if (fu.airDamage) {
-                    int d = distButNotReally(fu, *enemyIt);
+                    int d = distance(fu, *enemyIt);
                     if ((closestEnemy == enemyUnits.end() || d < closestDist) &&
                         d >= fu.airMinRange) {
                         closestDist = d;
@@ -272,7 +351,7 @@ namespace UAlbertaBot {
             }
             else {
                 if (fu.groundDamage) {
-                    int d = distButNotReally(fu, *enemyIt);
+                    int d = distance(fu, *enemyIt);
                     if ((closestEnemy == enemyUnits.end() || d < closestDist) &&
                         d >= fu.groundMinRange) {
                         closestDist = d;
@@ -282,7 +361,7 @@ namespace UAlbertaBot {
             }
         }
 
-        if (closestEnemy != enemyUnits.end() && sqrt(closestDist) <= fu.speed) {
+        if (closestEnemy != enemyUnits.end() && closestDist <= fu.speed) {
             if (closestEnemy->flying)
                 dealDamage(*closestEnemy, fu.airDamage, fu.airDamageType);
             else
@@ -298,7 +377,7 @@ namespace UAlbertaBot {
             didSomething = true;
             return true;
         }
-        else if (closestEnemy != enemyUnits.end() && sqrt(closestDist) > fu.speed) {
+        else if (closestEnemy != enemyUnits.end() && closestDist > fu.speed) {
             int dx = closestEnemy->x - fu.x, dy = closestEnemy->y - fu.y;
 
             fu.x += (int)(dx * (fu.speed / sqrt(dx * dx + dy * dy)));
@@ -413,7 +492,7 @@ namespace UAlbertaBot {
     FastAPproximation::FAPUnit::FAPUnit(UnitInfo ui)
         : x(ui.lastPosition.x), y(ui.lastPosition.y),
 
-        speed(ui.player->topSpeed(ui.type)),
+        speed(InformationManager::Instance().getUnitTopSpeed(ui.player, ui.type)),
 
         health(ui.lastHealth),
         maxHealth(ui.type.maxHitPoints()),
@@ -421,20 +500,22 @@ namespace UAlbertaBot {
         shields(ui.lastShields),
         shieldArmor(ui.player->getUpgradeLevel(BWAPI::UpgradeTypes::Protoss_Plasma_Shields)),
         maxShields(ui.type.maxShields()),
-        armor(ui.player->armor(ui.type)),
+        armor(InformationManager::Instance().getUnitArmor(ui.player, ui.type)),
         flying(ui.type.isFlyer()),
 
-        groundDamage(ui.player->damage(ui.type.groundWeapon())),
-        groundCooldown(ui.type.groundWeapon().damageFactor() && ui.type.maxGroundHits() ? ui.player->weaponDamageCooldown(ui.type) / (ui.type.groundWeapon().damageFactor() * ui.type.maxGroundHits()) : 0),
-        groundMaxRange(ui.player->weaponMaxRange(ui.type.groundWeapon())),
+        groundDamage(InformationManager::Instance().getWeaponDamage(ui.player, ui.type.groundWeapon())),
+        groundCooldown(ui.type.groundWeapon().damageFactor() && ui.type.maxGroundHits() ? InformationManager::Instance().getUnitCooldown(ui.player, ui.type) / (ui.type.groundWeapon().damageFactor() * ui.type.maxGroundHits()) : 0),
+        groundMaxRange(InformationManager::Instance().getWeaponRange(ui.player, ui.type.groundWeapon())),
         groundMinRange(ui.type.groundWeapon().minRange()),
         groundDamageType(ui.type.groundWeapon().damageType()),
 
-        airDamage(ui.player->damage(ui.type.airWeapon())),
+        airDamage(InformationManager::Instance().getWeaponDamage(ui.player, ui.type.airWeapon())),
         airCooldown(ui.type.airWeapon().damageFactor() && ui.type.maxAirHits() ? ui.type.airWeapon().damageCooldown() / (ui.type.airWeapon().damageFactor() * ui.type.maxAirHits()) : 0),
-        airMaxRange(ui.player->weaponMaxRange(ui.type.airWeapon())),
+        airMaxRange(InformationManager::Instance().getWeaponRange(ui.player, ui.type.airWeapon())),
         airMinRange(ui.type.airWeapon().minRange()),
         airDamageType(ui.type.airWeapon().damageType()),
+
+        attackCooldownRemaining(std::max(0, ui.groundWeaponCooldownFrame - BWAPI::Broodwar->getFrameCount())),
 
         unitType(ui.type),
         isOrganic(ui.type.isOrganic()),
@@ -447,7 +528,7 @@ namespace UAlbertaBot {
 
         if (ui.type == BWAPI::UnitTypes::Protoss_Carrier)
         {
-            groundDamage = ui.player->damage(
+            groundDamage = InformationManager::Instance().getWeaponDamage(ui.player, 
                 BWAPI::UnitTypes::Protoss_Interceptor.groundWeapon());
 
             if (ui.unit && ui.unit->isVisible()) {
@@ -484,10 +565,10 @@ namespace UAlbertaBot {
         } 
         else if (ui.type == BWAPI::UnitTypes::Terran_Bunker)
         {
-            groundDamage = ui.player->damage(BWAPI::WeaponTypes::Gauss_Rifle);
+            groundDamage = InformationManager::Instance().getWeaponDamage(ui.player, BWAPI::WeaponTypes::Gauss_Rifle);
             groundCooldown =
                 BWAPI::UnitTypes::Terran_Marine.groundWeapon().damageCooldown() / 4;
-            groundMaxRange = ui.player->weaponMaxRange(
+            groundMaxRange = InformationManager::Instance().getWeaponRange(ui.player, 
                 BWAPI::UnitTypes::Terran_Marine.groundWeapon()) +
                 32;
 
@@ -502,7 +583,16 @@ namespace UAlbertaBot {
         }
         else if (ui.type == BWAPI::UnitTypes::Protoss_Reaver)
         {
-            groundDamage = ui.player->damage(BWAPI::WeaponTypes::Scarab);
+            groundDamage = InformationManager::Instance().getWeaponDamage(ui.player, BWAPI::WeaponTypes::Scarab);
+        }
+        // Destroy score is not a good value measurement for static ground defense, so set them manually
+        else if (ui.type == BWAPI::UnitTypes::Protoss_Photon_Cannon)
+        {
+            score = 750; // approximate at 1.5 dragoons
+        }
+        else if (ui.type == BWAPI::UnitTypes::Zerg_Sunken_Colony)
+        {
+            score = 1000; // approximate at 2 dragoons
         }
 
         if (ui.unit && ui.unit->isStimmed()) {
@@ -510,14 +600,12 @@ namespace UAlbertaBot {
             airCooldown /= 2;
         }
 
-        if (ui.unit && ui.unit->isVisible() && !ui.unit->isFlying()) {
-            elevation = BWAPI::Broodwar->getGroundHeight(ui.unit->getTilePosition());
-        }
+        elevation = BWAPI::Broodwar->getGroundHeight(BWAPI::TilePosition(ui.lastPosition));
 
-        groundMaxRange *= groundMaxRange;
-        groundMinRange *= groundMinRange;
-        airMaxRange *= airMaxRange;
-        airMinRange *= airMinRange;
+        //groundMaxRange *= groundMaxRange;
+        //groundMinRange *= groundMinRange;
+        //airMaxRange *= airMaxRange;
+        //airMinRange *= airMinRange;
 
         health <<= 8;
         maxHealth <<= 8;

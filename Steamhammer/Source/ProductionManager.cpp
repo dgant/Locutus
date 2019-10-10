@@ -4,10 +4,9 @@
 #include "UnitUtil.h"
 #include "TechCompleteProductionGoal.h"
 #include "UpgradeCompleteProductionGoal.h"
+#include "PathFinding.h"
 
 using namespace UAlbertaBot;
-
-namespace { auto & bwemMap = BWEM::Map::Instance(); }
 
 ProductionManager::ProductionManager()
 	: _lastProductionFrame				 (0)
@@ -49,12 +48,23 @@ void ProductionManager::queueMacroAction(const MacroAct & macroAct)
 
 void ProductionManager::update() 
 {
+	BWAPI::Player _self = BWAPI::Broodwar->self();
 	// TODO move this to worker manager and make it more precise; it normally goes a little over
 	// If we have reached a target amount of gas, take workers off gas.
 	if (_targetGasAmount && BWAPI::Broodwar->self()->gatheredGas() >= _targetGasAmount)  // tends to go over
 	{
 		WorkerManager::Instance().setCollectGas(false);
 		_targetGasAmount = 0;           // clear the target
+	}
+
+	if (BWAPI::Broodwar->self()->minerals() < 50 && WorkerManager::Instance().getNumMineralWorkers() < 3) {
+		WorkerManager::Instance().setCollectGas(false);
+	}
+
+	if (!WorkerManager::Instance().isCollectingGas()) {
+		if (_self->minerals() > _self->gas() * 4 && UnitUtil::GetCompletedUnitCount(BWAPI::UnitTypes::Protoss_Assimilator) > 0) {
+			WorkerManager::Instance().setCollectGas(true);
+		}
 	}
 
 	// If we're in trouble, adjust the production queue to help.
@@ -183,6 +193,8 @@ bool ProductionManager::itemCanBeProduced(const MacroAct & act) const
 
 void ProductionManager::manageBuildOrderQueue()
 {
+	int frame = BWAPI::Broodwar->getFrameCount();
+
 	// If the extractor trick is in progress, do that.
 	if (_extractorTrickState != ExtractorTrick::None)
 	{
@@ -231,24 +243,26 @@ void ProductionManager::manageBuildOrderQueue()
 
             // Rules for gateways:
             // - Gateways we have must be in use
-            // - Only build at most 2 at a time
+            // - Limit how many gateways we build in parallel depending on how many we have
             // - Only build at most 3 per nexus
             // - On Plasma, only build at most one non-proxy gateway
             if (type == BWAPI::UnitTypes::Protoss_Gateway)
             {
                 int gatewaysBuilding = BuildingManager::Instance().numBeingBuilt(BWAPI::UnitTypes::Protoss_Gateway);
-                int gateways = UnitUtil::GetCompletedUnitCount(BWAPI::UnitTypes::Protoss_Gateway) + gatewaysBuilding;
+                int gateways = UnitUtil::GetCompletedUnitCount(BWAPI::UnitTypes::Protoss_Gateway);
                 
                 skipThisItem = gateways > 0 && (
                     StrategyManager::Instance().getProductionSaturation(BWAPI::UnitTypes::Protoss_Gateway) < 0.76 ||
                     gateways > nexuses * 3 ||
-                    gatewaysBuilding >= 2);
+                    gatewaysBuilding >= 4 ||
+                    (gateways < 10 && gatewaysBuilding >= 3) ||
+                    (gateways < 6 && gatewaysBuilding >= 2));
 
                 // Special case for Plasma
                 // Since our combat units can't mineral walk, make sure we only build gateways at the proxy location,
                 // unless we have none
                 if (BWAPI::Broodwar->mapHash() == "6f5295624a7e3887470f3f2e14727b1411321a67" &&
-                    gateways > 0 &&
+                    (gateways > 0 || gatewaysBuilding > 0) &&
                     currentItem.macroAct.getMacroLocation() != MacroLocation::Proxy)
                 {
                     skipThisItem = true;
@@ -262,12 +276,14 @@ void ProductionManager::manageBuildOrderQueue()
             else if (type == BWAPI::UnitTypes::Protoss_Stargate)
             {
                 int stargatesBuilding = BuildingManager::Instance().numBeingBuilt(BWAPI::UnitTypes::Protoss_Stargate);
-                int stargates = UnitUtil::GetCompletedUnitCount(BWAPI::UnitTypes::Protoss_Stargate) + stargatesBuilding;
+                int stargates = UnitUtil::GetAllUnitCount(BWAPI::UnitTypes::Protoss_Stargate);
 
                 skipThisItem = stargates > 0 && (
                     StrategyManager::Instance().getProductionSaturation(BWAPI::UnitTypes::Protoss_Stargate) < 0.76 ||
-                    stargates > nexuses * 2 ||
+					(stargates + stargatesBuilding) >= nexuses * 2 ||
                     stargatesBuilding >= 2);
+
+				skipThisItem = stargates > 2;
             }
 
             // Rules for forges:
@@ -276,7 +292,9 @@ void ProductionManager::manageBuildOrderQueue()
             {
                 int forges = UnitUtil::GetCompletedUnitCount(BWAPI::UnitTypes::Protoss_Forge) + BuildingManager::Instance().numBeingBuilt(BWAPI::UnitTypes::Protoss_Forge);
 
-                skipThisItem = forges * 3 >= nexuses;
+                skipThisItem = forges * 2 >= nexuses;
+
+				skipThisItem = forges > 2;
             }
 
             // Rules for robotics facilities:
@@ -285,8 +303,43 @@ void ProductionManager::manageBuildOrderQueue()
             {
                 int robos = UnitUtil::GetCompletedUnitCount(BWAPI::UnitTypes::Protoss_Robotics_Facility) + BuildingManager::Instance().numBeingBuilt(BWAPI::UnitTypes::Protoss_Robotics_Facility);
 
-                skipThisItem = robos * 3 >= nexuses;
+                skipThisItem = robos >= nexuses / 2;
             }
+			else if (type == BWAPI::UnitTypes::Protoss_Assimilator) {
+				skipThisItem = UnitUtil::GetAllUnitCount(BWAPI::UnitTypes::Protoss_Assimilator) >= UnitUtil::GetAllUnitCount(BWAPI::UnitTypes::Protoss_Nexus);
+
+				if (BWAPI::Broodwar->self()->minerals() < BWAPI::Broodwar->self()->gas()) {
+					skipThisItem = true;
+				}
+			}
+			else if (type == BWAPI::UnitTypes::Protoss_Cybernetics_Core) {
+				int numCybernetics = UnitUtil::GetAllUnitCount(BWAPI::UnitTypes::Protoss_Cybernetics_Core);
+				if (numCybernetics > 0) {
+					if (UnitUtil::GetCompletedUnitCount(BWAPI::UnitTypes::Protoss_Fleet_Beacon) < 1) {
+						skipThisItem = true;
+					}
+					else if (numCybernetics >= 2) {
+						skipThisItem = true;
+					}
+				}
+			}
+			else if (type == BWAPI::UnitTypes::Protoss_Nexus) {
+				if (BWAPI::Broodwar->enemy()->getRace() == BWAPI::Races::Protoss) {
+					if (nexuses >= 1 && frame < 7 * 60 * 24) {
+						skipThisItem = true;
+					}
+				}
+
+				if (BWAPI::Broodwar->enemy()->getRace() != BWAPI::Races::Terran) {
+					if (nexuses >= 2 && frame < 9 * 60 * 24 && BWAPI::Broodwar->self()->minerals() < 800) {
+						skipThisItem = true;
+					}
+
+					if (nexuses >= 3 && frame < 12 * 60 * 24 && BWAPI::Broodwar->self()->minerals() < 600) {
+						skipThisItem = true;
+					}
+				}
+			}
 
             if (skipThisItem)
 			{
@@ -652,10 +705,10 @@ void ProductionManager::create(BWAPI::Unit producer, const BuildOrderItem & item
 		&& !UnitUtil::IsMorphedBuildingType(act.getUnitType()))  // not morphed from another zerg building
 	{
 		// Every once in a while, pick a new base as the "main" base to build in.
-		if (act.getRace() != BWAPI::Races::Protoss || act.getUnitType() == BWAPI::UnitTypes::Protoss_Pylon)
-		{
-			InformationManager::Instance().maybeChooseNewMainBase();
-		}
+		//if (act.getRace() != BWAPI::Races::Protoss || act.getUnitType() == BWAPI::UnitTypes::Protoss_Pylon)
+		//{
+		//	InformationManager::Instance().maybeChooseNewMainBase();
+		//}
 
 		// By default, build in the main base.
 		// BuildingManager will override the location if it needs to.
@@ -671,11 +724,10 @@ void ProductionManager::create(BWAPI::Unit producer, const BuildOrderItem & item
 				desiredLocation = natural->getTilePosition();
 			}
 		}
-		else if (act.getMacroLocation() == MacroLocation::Center ||
-            act.getMacroLocation() == MacroLocation::Proxy ||
-            act.getMacroLocation() == MacroLocation::HiddenTech)
+		else if (act.getMacroLocation() == MacroLocation::Center)
 		{
 			// Near the center of the map.
+            // NOTE: This bugs out pylons if the center isn't reachable, e.g. neo moon glaive
 			desiredLocation = BWAPI::TilePosition(BWAPI::Broodwar->mapWidth()/2, BWAPI::Broodwar->mapHeight()/2);
 		}
 		
@@ -838,11 +890,8 @@ void ProductionManager::predictWorkerMovement(const Building & b)
 	if (!moveWorker) return;
 
 	// how many frames it will take us to move to the building location
-	// Use bwem pathfinding if direct distance is likely to be wrong
 	// We add some time since the actual pathfinding of the workers is bad
-	int distanceToMove = moveWorker->getDistance(walkToPosition);
-	if (distanceToMove > 200)
-		bwemMap.GetPath(moveWorker->getPosition(), walkToPosition, &distanceToMove);
+	int distanceToMove = PathFinding::GetGroundDistance(moveWorker->getPosition(), walkToPosition, PathFinding::PathFindingOptions::UseNearestBWEMArea);
 	double framesToMove = (distanceToMove / BWAPI::Broodwar->self()->getRace().getWorker().topSpeed()) * 1.4;
 
 	// Don't move if the dependencies won't be done in time
