@@ -63,7 +63,7 @@ namespace BWEB
 					continue;
 
 				auto blockCenter = Position(tile) + Position(128, 80);
-				const auto dist = blockCenter.getDistance(mainPosition) + (mainChoke ? blockCenter.getDistance(Position(mainChoke->Center())) : 0);
+				const auto dist = blockCenter.getDistance(mainPosition) + blockCenter.getDistance(Position(mainChoke->Center()));
 
 				int poweredDefenses = 0;
 				if (race == Races::Protoss)
@@ -116,7 +116,7 @@ namespace BWEB
 				auto tile = TilePosition(x, y);
 				if (!tile.isValid() || mapBWEM.GetArea(tile) != mainArea) continue;
 				auto blockCenter = Position(tile) + Position(80, 64);
-				const auto dist = blockCenter.getDistance(mainChoke ? Position(mainChoke->Center()) : mainPosition);
+				const auto dist = blockCenter.getDistance(Position(mainChoke->Center()));
 				if (dist > distBest && canAddBlock(tile, 5, 4))
 				{
 					best = tile;

@@ -4,7 +4,7 @@
 #include "BuildOrderQueue.h"
 #include "GameRecord.h"
 
-namespace UAlbertaBot
+namespace DaQinBot
 {
 
 // Unit choices for main unit mix and tech target.

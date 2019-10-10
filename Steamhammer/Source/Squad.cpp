@@ -6,17 +6,13 @@
 #include "MapGrid.h"
 #include "PathFinding.h"
 
-namespace { auto & bwemMap = BWEM::Map::Instance(); }
-namespace { auto & bwebMap = BWEB::Map::Instance(); }
-
-using namespace UAlbertaBot;
+using namespace DaQinBot;
 
 Squad::Squad()
 	: _name("Default")
 	, _combatSquad(false)
 	, _combatSimRadius(Config::Micro::CombatSimRadius)
-    , _ignoreCombatSimUntil(0)
-    , _fightVisibleOnly(false)
+	, _fightVisibleOnly(false)
 	, _hasAir(false)
 	, _hasGround(false)
 	, _canAttackAir(false)
@@ -38,14 +34,13 @@ Squad::Squad(const std::string & name, SquadOrder order, size_t priority)
 	: _name(name)
 	, _combatSquad(name != "Idle")
 	, _combatSimRadius(Config::Micro::CombatSimRadius)
-	, _ignoreCombatSimUntil(0)
 	, _fightVisibleOnly(false)
 	, _hasAir(false)
 	, _hasGround(false)
 	, _canAttackAir(false)
 	, _canAttackGround(false)
-    , _currentlyRegrouping(false)
-    , _attackAtMax(false)
+	, _currentlyRegrouping(false)
+	, _attackAtMax(false)
 	, _lastRetreatSwitch(0)
     , _lastRetreatSwitchVal(false)
     , _priority(priority)
@@ -55,7 +50,7 @@ Squad::Squad(const std::string & name, SquadOrder order, size_t priority)
 
 Squad::~Squad()
 {
-    if (gameEnded) return;
+	if (gameEnded) return;
     clear();
 }
 
@@ -74,7 +69,7 @@ void Squad::update()
 		return;
 	}
 
-	_microHighTemplar.update();
+	//_microHighTemplar.update();
 
 	if (_order.getType() == SquadOrderTypes::Load)
 	{
@@ -88,12 +83,6 @@ void Squad::update()
 		// And fall through to let the rest of the drop squad attack.
 	}
 
-    if (_order.getType() == SquadOrderTypes::BlockEnemyScout)
-    {
-        updateBlockScouting();
-        return;
-    }
-
 	bool needToRegroup = needsToRegroup();
     
 	if (Config::Debug::DrawSquadInfo && _order.isRegroupableOrder()) 
@@ -101,13 +90,17 @@ void Squad::update()
 		BWAPI::Broodwar->drawTextScreen(200, 350, "%c%s", white, _regroupStatus.c_str());
 	}
 
-    BWAPI::Position regroupPosition = BWAPI::Positions::Invalid;
-    if (needToRegroup)
-        regroupPosition = calcRegroupPosition();
+	BWAPI::Position regroupPosition = BWAPI::Positions::Invalid;
+	if (needToRegroup)
+		regroupPosition = calcRegroupPosition();
 
 	if (needToRegroup && regroupPosition.isValid())
 	{
-        _currentlyRegrouping = true;
+		_currentlyRegrouping = true;
+
+		// Regroup, aka retreat. Only fighting units care about regrouping.
+		//重整旗鼓，又名撤退。只有战斗单位才关心重新集结。
+		//BWAPI::Position regroupPosition = calcRegroupPosition();
 
         if (Config::Debug::DrawCombatSimulationInfo)
         {
@@ -123,25 +116,28 @@ void Squad::update()
 
 		_microAirToAir.regroup(regroupPosition, vanguard, _nearEnemy);
 		_microMelee.regroup(regroupPosition, vanguard, _nearEnemy);
+		_microDarkTemplar.regroup(regroupPosition, vanguard, _nearEnemy);
+		//_microHighTemplar.regroup(regroupPosition, vanguard, _nearEnemy);
 		_microRanged.regroup(regroupPosition, vanguard, _nearEnemy);
-        _microCarriers.regroup(regroupPosition, vanguard, _nearEnemy);
-		_microTanks.regroup(regroupPosition, vanguard, _nearEnemy);
+		//_microCarriers.regroup(regroupPosition, vanguard, _nearEnemy);
+		_microCarriers.execute();
+		//_microTanks.regroup(regroupPosition, vanguard, _nearEnemy);
+		_microDragoons.regroup(regroupPosition, vanguard, _nearEnemy);
 	}
 	else
 	{
-        _currentlyRegrouping = false;
+		_currentlyRegrouping = false;
 
 		// No need to regroup. Execute micro.
 		_microAirToAir.execute();
 		_microMelee.execute();
+		_microDarkTemplar.execute();
+		//_microHighTemplar.execute();
 		_microRanged.execute();
         _microCarriers.execute();
-		_microTanks.execute();
+		//_microTanks.execute();
+		_microDragoons.execute();
 	}
-
-    // Dark templar handle retreating on their own
-    // No need to retreat them if the enemy has no detection
-    _microDarkTemplar.execute();
 
     // Execute micro for bunker squads
     for (auto& pair : bunkerAttackSquads)
@@ -151,10 +147,10 @@ void Squad::update()
 
 	// Lurkers never regroup, always execute their order.
 	// TODO It is because regrouping works poorly. It retreats and unburrows them too often.
-	_microLurkers.execute();
+	//_microLurkers.execute();
 
 	// Maybe stim marines and firebats.
-	stimIfNeeded();
+	//stimIfNeeded();
 
 	// The remaining non-combat micro managers try to keep units near the front line.
 	if (BWAPI::Broodwar->getFrameCount() % 8 == 3)    // deliberately lag a little behind reality
@@ -164,6 +160,8 @@ void Squad::update()
 		// Medics.
 		BWAPI::Position medicGoal = vanguard && vanguard->getPosition().isValid() ? vanguard->getPosition() : calcCenter();
 		_microMedics.update(medicGoal);
+
+		_microHighTemplar.update(medicGoal);
 
 		// Detectors.
 		_microDetectors.setUnitClosestToEnemy(vanguard);
@@ -276,12 +274,16 @@ void Squad::addUnitsToMicroManagers()
 	BWAPI::Unitset lurkerUnits;
     BWAPI::Unitset tankUnits;
     BWAPI::Unitset medicUnits;
+	BWAPI::Unitset dragoonUnits;
 
 	for (const auto unit : _units)
 	{
 		if (unit->isCompleted() && unit->exists() && unit->getHitPoints() > 0 && !unit->isLoaded())
 		{
-			if (unit->getType() == BWAPI::UnitTypes::Terran_Valkyrie ||
+			if (unit->getType() == BWAPI::UnitTypes::Protoss_Dragoon) {
+				dragoonUnits.insert(unit);
+			}
+			else if (unit->getType() == BWAPI::UnitTypes::Terran_Valkyrie ||
 				unit->getType() == BWAPI::UnitTypes::Protoss_Corsair ||
 				unit->getType() == BWAPI::UnitTypes::Zerg_Devourer)
 			{
@@ -294,6 +296,10 @@ void Squad::addUnitsToMicroManagers()
 			else if (unit->getType() == BWAPI::UnitTypes::Protoss_Dark_Templar)
 			{
 				darkTemplarUnits.insert(unit);
+			}
+			else  if (unit->getType() == BWAPI::UnitTypes::Protoss_Arbiter)
+			{
+				detectorUnits.insert(unit);
 			}
 			else if (unit->getType() == BWAPI::UnitTypes::Protoss_Carrier)
             {
@@ -353,73 +359,20 @@ void Squad::addUnitsToMicroManagers()
 	_microDetectors.setUnits(detectorUnits);
 	_microDarkTemplar.setUnits(darkTemplarUnits);
 	_microHighTemplar.setUnits(highTemplarUnits);
-	_microLurkers.setUnits(lurkerUnits);
-	_microMedics.setUnits(medicUnits);
-	_microTanks.setUnits(tankUnits);
+	//_microLurkers.setUnits(lurkerUnits);
+	//_microMedics.setUnits(medicUnits);
+	//_microTanks.setUnits(tankUnits);
 	_microTransports.setUnits(transportUnits);
-}
-
-bool Squad::attackTerranPush()
-{
-    // Against terran attack a terran push when it gets close to firing range of our natural
-    // We otherwise have a tendency to just keep backing up until we get rolled over
-
-    if (BWAPI::Broodwar->enemy()->getRace() != BWAPI::Races::Terran) return false;
-
-    if (getName() != "Ground") return false;
-    if (_units.size() < 15) return false;
-
-    if (UnitUtil::GetCompletedUnitCount(BWAPI::UnitTypes::Protoss_Probe) < 45) return false;
-
-    if (!InformationManager::Instance().haveWeTakenOurNatural()) return false;
-
-    BWAPI::Unit ourVanguard = unitClosestTo(_order.getPosition());
-    if (!ourVanguard) return false; // We have no units?
-
-    // Is our squad near the natural?
-    auto naturalDist = PathFinding::GetGroundDistance(ourVanguard->getPosition(), InformationManager::Instance().getMyNaturalLocation()->getPosition());
-    auto mainDist = PathFinding::GetGroundDistance(ourVanguard->getPosition(), InformationManager::Instance().getMyMainBaseLocation()->getPosition());
-    if (naturalDist > 640 || mainDist < naturalDist) return false;
-
-    // Count our units
-    int ourUnitCount = 0;
-    int ourHeight = 0;
-    for (auto unit : _units)
-        if (UnitUtil::IsCombatUnit(unit) && unit->getDistance(ourVanguard) < 640) // 20 tiles
-        {
-            ourUnitCount++;
-            ourHeight += BWAPI::Broodwar->getGroundHeight(unit->getTilePosition());
-        }
-    if (ourUnitCount < 15) return false;
-
-    // Get nearby opponent units
-    int enemyMechUnitCount = 0;
-    int enemyMechUnitHeight = 0;
-    for (auto & unit : InformationManager::Instance().getUnitInfo(BWAPI::Broodwar->enemy()))
-    {
-        if (!unit.second.lastPosition.isValid() || unit.second.goneFromLastPosition) continue;
-        if (unit.second.type != BWAPI::UnitTypes::Terran_Siege_Tank_Tank_Mode &&
-            unit.second.type != BWAPI::UnitTypes::Terran_Siege_Tank_Siege_Mode &&
-            unit.second.type != BWAPI::UnitTypes::Terran_Vulture &&
-            unit.second.type != BWAPI::UnitTypes::Terran_Goliath)
-        {
-            continue;
-        }
-        if (unit.second.lastPosition.getApproxDistance(ourVanguard->getPosition()) > 1280) continue; // 40 tiles
-        enemyMechUnitCount++;
-        enemyMechUnitHeight += BWAPI::Broodwar->getGroundHeight(BWAPI::TilePosition(unit.second.lastPosition));
-    }
-    if (enemyMechUnitCount < 5) return false;
-
-    // If the enemy army is on higher ground, don't attack
-    if (((double)enemyMechUnitHeight / (double)enemyMechUnitCount) > (0.1 + ((double)ourHeight / (double)ourUnitCount))) return false;
-
-    return ourUnitCount > enemyMechUnitCount;
+	_microDragoons.setUnits(dragoonUnits);
 }
 
 // Calculates whether to regroup, aka retreat. Does combat sim if necessary.
+//计算是否重组，又名撤退。如果有必要的话，与sim战斗。
 bool Squad::needsToRegroup()
 {
+	BWAPI::Player _self = BWAPI::Broodwar->self();
+	BWAPI::Player _enemy = BWAPI::Broodwar->enemy();
+
 	if (_units.empty())
 	{
 		_regroupStatus = std::string("No attackers available");
@@ -434,31 +387,27 @@ bool Squad::needsToRegroup()
 		return false;
 	}
 
-    // We don't want to run the combat sim until a later frame
-    if (BWAPI::Broodwar->getFrameCount() < _ignoreCombatSimUntil)
-    {
-        _regroupStatus = std::string("Attack terran push");
-        return false;
-    }
+	if (BWAPI::Broodwar->enemy()->getRace() == BWAPI::Races::Protoss) {
+		if (BWAPI::Broodwar->getFrameCount() < 8000 && InformationManager::Instance().canAggression()) {
+			return false;
+		}
 
-    if (attackTerranPush())
-    {
-        Log().Get() << "Attacking terran push";
-        _ignoreCombatSimUntil = BWAPI::Broodwar->getFrameCount() + (15 * 24);
-        _regroupStatus = std::string("Attack terran push");
-        return false;
-    }
+		if (InformationManager::Instance().canAggression() && UnitUtil::GetCompletedUnitCount(BWAPI::UnitTypes::Protoss_Dark_Templar, _self) > 0 && UnitUtil::GetCompletedUnitCount(BWAPI::UnitTypes::Protoss_Observer, _enemy) == 0) {
+			//如果我方战斗力是敌人的1.25倍，则进攻
+			return false;
+		}
+	}
 
 	// If we're nearly maxed and have good income or cash, don't retreat.
-	if (BWAPI::Broodwar->self()->supplyUsed() >= 390 &&
-		(BWAPI::Broodwar->self()->minerals() > 1000 || WorkerManager::Instance().getNumMineralWorkers() > 12))
+	if (_self->supplyUsed() >= 340 &&
+		(_self->minerals() > 600 || UnitUtil::GetCompletedUnitCount(BWAPI::UnitTypes::Protoss_Gateway) >= 8))
 	{
 		_attackAtMax = true;
 	}
 
 	if (_attackAtMax)
 	{
-		if (BWAPI::Broodwar->self()->supplyUsed() < 320)
+		if (BWAPI::Broodwar->self()->supplyUsed() < 240)
 		{
 			_attackAtMax = false;
 		}
@@ -468,6 +417,8 @@ bool Squad::needsToRegroup()
 			return false;
 		}
 	}
+
+	if (_attackAtMax) return false;
 
     // Don't retreat if we are actively doing a run-by
     // TODO: Split the run-by units into their own squad
@@ -479,19 +430,21 @@ bool Squad::needsToRegroup()
     }
 
 	// If we most recently retreated, don't attack again until retreatDuration frames have passed.
+	//如果我们最近一次撤退，在撤退持续时间结束之前不要再进攻。
 	const int retreatDuration = 2 * 24;
 	bool retreat = _lastRetreatSwitchVal && (BWAPI::Broodwar->getFrameCount() - _lastRetreatSwitch < retreatDuration);
 
 	if (!retreat)
 	{
         // All other checks are done. Finally do the expensive combat simulation.
+		//所有其他检查都完成了。最后做昂贵的战斗模拟。
         int score = runCombatSim(_order.getPosition());
 
 		retreat = score < 0;
 		_lastRetreatSwitch = BWAPI::Broodwar->getFrameCount();
 		_lastRetreatSwitchVal = retreat;
 	}
-	
+
 	if (retreat)
 	{
 		_regroupStatus = std::string("Retreat");
@@ -546,6 +499,8 @@ bool Squad::unitNearEnemy(BWAPI::Unit unit)
 
     // Consider all enemy units, even if they are no longer visible
     // Otherwise we just stand still and let tanks range us down
+	//考虑所有的敌人单位，即使他们不再可见
+	//否则我们就站着别动，让坦克开进我们的射程
     std::vector<UnitInfo> enemyUnits;
     InformationManager::Instance().getNearbyForce(enemyUnits, unit->getPosition(), BWAPI::Broodwar->enemy(), 400);
 
@@ -600,6 +555,11 @@ BWAPI::Position Squad::calcRegroupPosition()
 {
 	BWAPI::Position regroup(0,0);
 
+	if (BWAPI::Broodwar->getFrameCount() < 5000) {
+		regroup = BWTA::getRegion(InformationManager::Instance().getMyMainBaseLocation()->getTilePosition())->getCenter();
+		return regroup;
+	}
+
 	int minDist = 100000;
 
 	// Retreat to the location of the squad unit not near the enemy which is
@@ -612,10 +572,22 @@ BWAPI::Position Squad::calcRegroupPosition()
 		// Count combat units only. Bug fix originally thanks to AIL, it's been rewritten a bit since then.
 		if (!_nearEnemy[unit] &&
 			!unit->getType().isDetector() &&
+			!unit->getType().isFlyer() &&
 			unit->getType() != BWAPI::UnitTypes::Terran_Medic &&
 			unit->getPosition().isValid())    // excludes loaded units
 		{
 			int dist = unit->getDistance(_order.getPosition());
+
+			/*
+			if (unit->getType() == BWAPI::UnitTypes::Protoss_Dark_Templar) {
+				dist -= 6 * 32;
+			}
+			*/
+
+			if (unit->getType() == BWAPI::UnitTypes::Protoss_Reaver) {
+				dist -= 10 * 32;
+			}
+
 			if (dist < minDist)
 			{
 				// If the squad has any ground units, don't try to retreat to the position of an air unit
@@ -656,7 +628,8 @@ BWAPI::Unit Squad::unitClosestToOrderPosition() const
 }
 
 // Return the unit closest to the order position
-BWAPI::Unit Squad::unitClosestTo(BWAPI::Position position) const
+//返回最接近订单位置的单元
+BWAPI::Unit Squad::unitClosestTo(BWAPI::Position position, bool debug) const
 {
 	BWAPI::Unit closest = nullptr;
 	int closestDist = INT_MAX;
@@ -668,6 +641,7 @@ BWAPI::Unit Squad::unitClosestTo(BWAPI::Position position) const
 		// Non-combat units should be ignored for this calculation.
 		if (unit->getType().isDetector() ||
 			!unit->getPosition().isValid() ||       // includes units loaded into bunkers or transports
+			unit->getType().isFlyer() ||
 			unit->getType() == BWAPI::UnitTypes::Terran_Medic)
 		{
 			continue;
@@ -677,7 +651,7 @@ BWAPI::Unit Squad::unitClosestTo(BWAPI::Position position) const
 		if (_hasGround)
 		{
 			// A ground or air-ground squad. Use ground distance.
-            dist = PathFinding::GetGroundDistance(unit->getPosition(), position, unit->getType());
+            dist = PathFinding::GetGroundDistance(unit->getPosition(), position);
 		}
 		else
 		{
@@ -713,14 +687,15 @@ void Squad::setSquadOrder(const SquadOrder & so)
 	// Pass the order on to all micromanagers.
 	_microAirToAir.setOrder(so);
 	_microMelee.setOrder(so);
+	_microDragoons.setOrder(so);
 	_microRanged.setOrder(so);
     _microCarriers.setOrder(so);
 	_microDetectors.setOrder(so);
 	_microDarkTemplar.setOrder(so);
 	_microHighTemplar.setOrder(so);
-	_microLurkers.setOrder(so);
-	_microMedics.setOrder(so);
-	_microTanks.setOrder(so);
+	//_microLurkers.setOrder(so);
+	//_microMedics.setOrder(so);
+	//_microTanks.setOrder(so);
 	_microTransports.setOrder(so);
 }
 
@@ -765,12 +740,17 @@ const std::string & Squad::getName() const
 // The drop squad has been given a Load order. Load up the transports for a drop.
 // Unlike other code in the drop system, this supports any number of transports, including zero.
 // Called once per frame while a Load order is in effect.
+//空投队接到了装载命令。将传输加载到drop中。
+//不像drop系统中的其他代码，它支持任意数量的传输，包括0。
+//在加载顺序有效时，每帧调用一次。
 void Squad::loadTransport()
 {
 	for (const auto trooper : _units)
 	{
 		// If it's not the transport itself, send it toward the order location,
 		// which is set to the transport's initial location.
+		//如果不是运输工具本身，把它发送到订购地点，
+		//设置为传输的初始位置。
 		if (trooper->exists() && !trooper->isLoaded() && trooper->getType().spaceProvided() == 0)
 		{
 			Micro::Move(trooper, _order.getPosition());
@@ -853,6 +833,7 @@ void Squad::stimIfNeeded()
 	}
 
 	// Next marines, treated the same except for range and hit points.
+	//下一个陆战队员，除了射程和生命值之外，都受到相同的待遇。
 	for (const auto marine : _microRanged.getUnits())
 	{
 		// Invalid position means the marine is probably in a bunker or transport.
@@ -879,9 +860,11 @@ void Squad::stimIfNeeded()
 
 void Squad::addUnitToBunkerAttackSquad(BWAPI::Position bunkerPosition, BWAPI::Unit unit)
 {
-    bunkerAttackSquads[bunkerPosition].addUnit(bunkerPosition, unit);
+	//去掉攻击地堡部队
+    //bunkerAttackSquads[bunkerPosition].addUnit(bunkerPosition, unit);
 }
 
+//如果关闭，增加地堡攻击小队的单位
 bool Squad::addUnitToBunkerAttackSquadIfClose(BWAPI::Unit unit)
 {
     if (unit->isFlying()) return false;
@@ -893,9 +876,9 @@ bool Squad::addUnitToBunkerAttackSquadIfClose(BWAPI::Unit unit)
         if (ui.second.type != BWAPI::UnitTypes::Terran_Bunker) continue;
         if (ui.second.goneFromLastPosition) continue;
         if (!ui.second.completed && ui.second.estimatedCompletionFrame > BWAPI::Broodwar->getFrameCount()) continue;
-        if (unit->getDistance(ui.second.lastPosition) > 1000) continue;
+        if (unit->getDistance(ui.second.lastPosition) > 30 * 32) continue;
 
-        int unitDist = PathFinding::GetGroundDistance(unit->getPosition(), _order.getPosition(), unit->getType());
+        int unitDist = PathFinding::GetGroundDistance(unit->getPosition(), _order.getPosition());
         int bunkerDist = PathFinding::GetGroundDistance(ui.second.lastPosition, _order.getPosition());
         if (unitDist != -1 && bunkerDist != -1 && unitDist > (bunkerDist - 128))
         {
@@ -909,6 +892,8 @@ bool Squad::addUnitToBunkerAttackSquadIfClose(BWAPI::Unit unit)
 
 MicroBunkerAttackSquad * Squad::getBunkerRunBySquad(BWAPI::Unit unit)
 {
+	return nullptr;
+
     for (auto& pair : bunkerAttackSquads)
         if (pair.second.isPerformingRunBy(unit) || pair.second.hasPerformedRunBy(unit))
             return &pair.second;
@@ -918,7 +903,7 @@ MicroBunkerAttackSquad * Squad::getBunkerRunBySquad(BWAPI::Unit unit)
 int Squad::runCombatSim(BWAPI::Position targetPosition)
 {
     // Get our "vanguard unit"
-    BWAPI::Unit ourVanguard = unitClosestTo(targetPosition);
+    BWAPI::Unit ourVanguard = unitClosestTo(targetPosition, true);
     if (!ourVanguard) return 1; // We have no units
 
     // Get the enemy "vanguard unit"
@@ -926,32 +911,36 @@ int Squad::runCombatSim(BWAPI::Position targetPosition)
     BWAPI::Position enemyVanguard = BWAPI::Positions::Invalid;
     for (const auto & ui : InformationManager::Instance().getUnitInfo(BWAPI::Broodwar->enemy()))
     {
-        if (_fightVisibleOnly && (!ui.first || !ui.first->exists() || !ui.first->isVisible())) continue;
-
         if (ui.second.goneFromLastPosition) continue;
-
-        int dist = MathUtil::EdgeToEdgeDistance(ourVanguard->getType(), ourVanguard->getPosition(), ui.second.type, ui.second.lastPosition);
-
-        int range = UnitUtil::GetAttackRangeAssumingUpgrades(ui.second.type, ourVanguard->getType());
-        if (dist < (range + 64) && dist < closestDist && dist != -1)
+        int dist = ui.second.isFlying || ourVanguard->isFlying()
+            ? ui.second.lastPosition.getApproxDistance(ourVanguard->getPosition())
+            : PathFinding::GetGroundDistance(ui.second.lastPosition, ourVanguard->getPosition());
+        if (dist < closestDist && dist != -1)
         {
             closestDist = dist;
             enemyVanguard = ui.second.lastPosition;
         }
     }
-    if (!enemyVanguard.isValid()) return 1; // Enemy has no units in range
+    if (!enemyVanguard.isValid()) return 1; // Enemy has no units
 
     // Special case: ignore enemy bunkers if:
     // - Our squad is entirely ranged goons
     // - The enemy doesn't have the marine range upgrade
     // - The enemy doesn't have any other units in the combat sim radius
     // - None of our goons are moving into range of an enemy bunker (unless they are in a bunker attack squad)
+	//特殊情况:如果:
+	// -我们的小队全是远程打手
+	// -敌人没有海军射程升级
+	// -敌人在战斗模拟半径内没有其他单位
+	// -我们的打手没有一个进入敌人掩体的射程(除非他们在掩体攻击小队)
     bool ignoreBunkers = 
         BWAPI::Broodwar->self()->getUpgradeLevel(BWAPI::UpgradeTypes::Singularity_Charge) &&
         !InformationManager::Instance().enemyHasInfantryRangeUpgrade();
+
     if (ignoreBunkers)
     {
         // Gather enemy bunker positions and break if the enemy has other units
+		//集结敌人碉堡阵地，如果敌人有其他单位，则破坏
         std::vector<BWAPI::Position> bunkers;
         for (auto const & ui : InformationManager::Instance().getUnitInfo(BWAPI::Broodwar->enemy()))
         {
@@ -971,10 +960,13 @@ int Squad::runCombatSim(BWAPI::Position targetPosition)
         if (!bunkers.empty())
         {
             // Make sure all of our units are goons and out of range of the bunker
+			//确保我们所有的部队都是暴徒，不在掩体的射程之内
             for (auto & unit : _units)
             {
                 // If the unit is part of a bunker attack squad, all is well
                 // They are allowed to move through the attack range of the bunker
+				//如果该部队是碉堡攻击小队的一员，一切都很好
+				//允许他们通过掩体的攻击范围
                 if (getBunkerRunBySquad(unit)) continue;
 
                 if (unit->getType() != BWAPI::UnitTypes::Protoss_Dragoon)
@@ -1061,198 +1053,7 @@ bool Squad::hasMicroManager(const MicroManager* microManager) const
         &_microMedics == microManager ||
         &_microMelee == microManager ||
         &_microRanged == microManager ||
+		&_microDragoons == microManager ||
         &_microTanks == microManager ||
         &_microTransports == microManager;
-}
-
-void Squad::updateBlockScouting()
-{
-	if (!bwebMap.mainChoke) return;
-	
-    ChokeData & chokeData = *((ChokeData*)bwebMap.mainChoke->Ext());
-
-    // Determine which set of block positions to use
-
-    // Normally we use the zealot positions once a zealot is added to the squad
-    bool useZealotPositions = containsUnitType(BWAPI::UnitTypes::Protoss_Zealot);
-
-    // But we need to handle the situation when going from one probe to two zealots specially
-    bool switchingFromOneToTwoUnits = false;
-    if (useZealotPositions &&
-        chokeData.zealotBlockScoutPositions.size() == 2 &&
-        chokeData.probeBlockScoutPositions.size() == 1)
-    {
-        int zealotCount = 0;
-        int probeCount = 0;
-        int probeInPosition = false;
-        int zealotNearPosition = false;
-        for (auto unit : _units)
-            if (unit->getType() == BWAPI::UnitTypes::Protoss_Zealot)
-            {
-                zealotCount++;
-                zealotNearPosition = unit->getDistance(*chokeData.probeBlockScoutPositions.begin()) < 20;
-            }
-            else if (unit->getType() == BWAPI::UnitTypes::Protoss_Probe)
-            {
-                probeCount++;
-                probeInPosition = probeInPosition || unit->getPosition() == *chokeData.probeBlockScoutPositions.begin();
-            }
-
-        if (zealotCount == 1 && probeCount == 1 && probeInPosition && !zealotNearPosition)
-            switchingFromOneToTwoUnits = true;
-    }
-
-    std::set<BWAPI::Position> & blockPositions = 
-        (useZealotPositions && !switchingFromOneToTwoUnits)
-        ? chokeData.zealotBlockScoutPositions 
-        : chokeData.probeBlockScoutPositions;
-
-    if (_units.size() < blockPositions.size()) return;
-
-    // Assign a position to each unit
-    std::map<BWAPI::Unit, BWAPI::Position> assignedPositions;
-    std::set<BWAPI::Position> positions(blockPositions);
-
-    // First pass: combat units already in position
-    for (auto unit : _units)
-        if (!unit->getType().isWorker())
-        {
-            auto it = positions.find(unit->getPosition());
-            if (it == positions.end()) continue;
-            positions.erase(it);
-            assignedPositions[unit] = unit->getPosition();
-        }
-
-    // Second pass: combat units not already in position
-    for (auto unit : _units)
-        if (!unit->getType().isWorker() && 
-            assignedPositions.find(unit) == assignedPositions.end() &&
-            !positions.empty() &&
-            unit->getDistance(_order.getPosition()) < 96)
-        {
-            if (positions.size() == 1)
-            {
-                assignedPositions[unit] = *positions.begin();
-                if (!switchingFromOneToTwoUnits) positions.erase(positions.begin());
-            }
-            else
-            {
-                BWAPI::Position best = BWAPI::Positions::Invalid;
-                int bestDist = INT_MAX;
-                for (auto pos : positions)
-                {
-                    int dist = unit->getDistance(pos);
-                    if (dist < bestDist)
-                    {
-                        bestDist = dist;
-                        best = pos;
-                    }
-                }
-                assignedPositions[unit] = best;
-                if (!switchingFromOneToTwoUnits) positions.erase(best);
-            }
-        }
-
-    // Third pass: workers already in position
-    for (auto unit : _units)
-        if (unit->getType().isWorker())
-        {
-            auto it = positions.find(unit->getPosition());
-            if (it == positions.end()) continue;
-            positions.erase(it);
-            assignedPositions[unit] = unit->getPosition();
-        }
-
-    // Fourth pass: workers not already in position
-    for (auto unit : _units)
-        if (unit->getType().isWorker() && !positions.empty() && assignedPositions.find(unit) == assignedPositions.end())
-        {
-            assignedPositions[unit] = *positions.begin();
-            positions.erase(positions.begin());
-        }
-
-    // Issue orders
-    for (auto it = _units.begin(); it != _units.end(); )
-    {
-        auto unit = *it;
-
-        BWAPI::Position pos;
-        auto assignment = assignedPositions.find(unit);
-
-        // First case: this unit has an assigned position
-        if (assignment != assignedPositions.end())
-            pos = assignment->second;
-
-        // Second case: this unit is a combat unit without an assigned position
-        // It moves towards the order position (i.e. choke center) and is assigned
-        // a position when it gets closer
-        else if (!unit->getType().isWorker())
-            pos = _order.getPosition();
-
-        // Final case: this unit is a worker without an assigned position
-        // This means it is being replaced by a combat unit
-        // We wait until the replacement unit is close by, then mineral walk back to base
-        else
-        {
-            // Handle unit that is currently mineral walking
-            if (unit->getOrder() == BWAPI::Orders::MoveToMinerals)
-            {
-                // Release the unit from the squad when it gets far enough away
-                if (unit->getDistance(BWAPI::Position(bwebMap.mainChoke->Center()) + BWAPI::Position(4, 4)) > 100)
-                {
-                    if (unit->getType().isWorker()) WorkerManager::Instance().finishedWithWorker(unit);
-                    it = _units.erase(it);
-                    continue;
-                }
-                goto nextUnit;
-            }
-            
-            // Check if there is a combat unit close by that is moving towards a position
-            for (auto other : _units)
-                if (other != unit && !other->getType().isWorker() && other->getDistance(unit) < 10 &&
-                    other->getOrder() == BWAPI::Orders::Move && unit->getDistance(other->getOrderTargetPosition()) < 30)
-                {
-                    // Start mineral walking
-                    for (const auto staticNeutral : BWAPI::Broodwar->getStaticNeutralUnits())
-                    {
-                        if (!staticNeutral->getType().isMineralField()) continue;
-                        if (!staticNeutral->exists() || !staticNeutral->isVisible()) continue;
-                        if (bwemMap.GetNearestArea(staticNeutral->getTilePosition()) != bwebMap.mainArea) continue;
-                        Micro::RightClick(unit, staticNeutral);
-                        goto nextUnit;
-                    }
-                }
-
-            // Otherwise set the position to our current position and fall through
-            pos = unit->getPosition();
-        }
-
-        // If we aren't at the desired position, move there
-        if (unit->getPosition() != pos)
-        {
-            Micro::Move(unit, pos);
-            goto nextUnit;
-        }
-
-        // If there is an enemy worker in range where we can attack it without moving, attack it
-        // We are a bit conservative to be absolutely sure we don't move
-        int desiredRange = (UnitUtil::GetAttackRangeAssumingUpgrades(unit->getType(), BWAPI::UnitTypes::Protoss_Probe) * 2) / 3;
-        for (auto enemy : BWAPI::Broodwar->enemy()->getUnits())
-            if (enemy->getType().isWorker() && enemy->getDistance(unit) <= desiredRange &&
-                MathUtil::EdgeToEdgeDistance(
-                    unit->getType(), 
-                    unit->getPosition(), 
-                    enemy->getType(), 
-                    InformationManager::Instance().predictUnitPosition(enemy, BWAPI::Broodwar->getRemainingLatencyFrames())) <= desiredRange)
-            {
-                Micro::AttackUnit(unit, enemy);
-                goto nextUnit;
-            }
-
-        // Otherwise hold position
-        unit->holdPosition();
-
-    nextUnit:;
-        it++;
-    }
 }

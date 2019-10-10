@@ -17,10 +17,11 @@
 #include "MicroMedics.h"
 #include "MicroTanks.h"
 #include "MicroTransports.h"
+#include "MicroDragoon.h"
 
 #include "MicroBunkerAttackSquad.h"
 
-namespace UAlbertaBot
+namespace DaQinBot
 {
 
 class Squad
@@ -29,17 +30,17 @@ class Squad
 	BWAPI::Unitset      _units;
 	bool				_combatSquad;
 	int					_combatSimRadius;
-    int                 _ignoreCombatSimUntil;
 	bool				_fightVisibleOnly;  // combat sim uses visible enemies only (vs. all known enemies)
 	bool				_hasAir;
 	bool				_hasGround;
 	bool				_canAttackAir;
 	bool				_canAttackGround;
 	std::string         _regroupStatus;
-    bool                _currentlyRegrouping;
+	bool                _currentlyRegrouping;
 	bool				_attackAtMax;       // turns true when we are at max supply
     int                 _lastRetreatSwitch;
     bool                _lastRetreatSwitchVal;
+	int					_lastRetreatScore;//最后一次撤退的分数
     size_t              _priority;
 	
 	SquadOrder          _order;
@@ -54,6 +55,7 @@ class Squad
 	MicroMedics			_microMedics;
 	MicroTanks			_microTanks;
 	MicroTransports		_microTransports;
+	MicroDragoon		_microDragoons;
 
     CombatSimulation    sim;
 
@@ -72,10 +74,6 @@ class Squad
 
 	void			loadTransport();
 	void			stimIfNeeded();
-
-    void            updateBlockScouting();
-
-    bool attackTerranPush();
 
 public:
 
@@ -98,7 +96,7 @@ public:
 	BWAPI::Position     calcCenter() const;
 	BWAPI::Position     calcRegroupPosition();
     BWAPI::Unit		    unitClosestToOrderPosition() const;
-    BWAPI::Unit		    unitClosestTo(BWAPI::Position position) const;
+    BWAPI::Unit		    unitClosestTo(BWAPI::Position position, bool debug = false) const;
 
 	const BWAPI::Unitset &  getUnits() const;
 	void                setSquadOrder(const SquadOrder & so);
@@ -111,7 +109,6 @@ public:
 	int					getCombatSimRadius() const { return _combatSimRadius; };
 	void				setCombatSimRadius(int radius) { _combatSimRadius = radius; };
     int                 runCombatSim(BWAPI::Position position);
-    void                ignoreCombatSimUntil(int frame) { _ignoreCombatSimUntil = frame; }
 
 	bool				getFightVisible() const { return _fightVisibleOnly; };
 	void				setFightVisible(bool visibleOnly) { _fightVisibleOnly = visibleOnly; };
@@ -123,7 +120,7 @@ public:
 	const bool			hasDetector()		const { return !_microDetectors.getUnits().empty(); };
 	const bool			hasCombatUnits()	const;
 	const bool			isOverlordHunterSquad() const;
-    const bool          isRegrouping() const { return _currentlyRegrouping; };
+	const bool          isRegrouping() const { return _currentlyRegrouping; };
 
     bool                hasMicroManager(const MicroManager* microManager) const;
 };

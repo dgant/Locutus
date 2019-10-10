@@ -2,94 +2,136 @@
 #include "OpponentModel.h"
 #include "Random.h"
 
-using namespace UAlbertaBot;
+using namespace DaQinBot;
 
 OpeningPlan OpponentModel::predictEnemyPlan() const
 {
-	struct PlanInfo
+	struct PlanInfoType
 	{
-        std::map<OpeningPlan, int> playedAfterWin;  // Which plans were played after this plan won?
-        std::map<OpeningPlan, int> playedAfterLoss; // Which plans were played after this plan lost?
+		int wins;
+		int games;
+		double weight;
+        bool alwaysSwitchesAfterLoss; // Does the opponent always choose a different opening after this one loses?
+        bool alwaysPlaysAfterWin;     // Does the opponent always choose this opening again after it wins?
 	};
-    std::map<OpeningPlan, PlanInfo> plans;
+	PlanInfoType planInfo[int(OpeningPlan::Size)];
 
-    // Step 1: gather information about how the enemy reacts to winning / losing with various plans
+	// 1. Initialize.
+	for (int plan = int(OpeningPlan::Unknown); plan < int(OpeningPlan::Size); ++plan)
+	{
+		planInfo[plan].wins = 0;
+		planInfo[plan].games = 0;
+		planInfo[plan].weight = 0.0;
+		planInfo[plan].alwaysSwitchesAfterLoss = plan != int(OpeningPlan::Unknown);
+        planInfo[plan].alwaysPlaysAfterWin = plan != int(OpeningPlan::Unknown);
+	}
+
+    std::ostringstream log;
+    log << "Predicting enemy plan:";
+
+    // 2. Perform initial forward pass to initialize "alwaysSwitchesAfterLoss" and "alwaysPlaysAfterWin"
     GameRecord* previous = nullptr;
     for (int i = std::max(0U, _pastGameRecords.size() - 50); i < _pastGameRecords.size(); i++)
     {
         GameRecord* current = _pastGameRecords[i];
-
-        if (!_gameRecord.sameMatchup(*current)) continue;
-
         if (previous && previous->getEnemyPlan() != OpeningPlan::Unknown && current->getEnemyPlan() != OpeningPlan::Unknown)
         {
-            if (previous->getWin())
-                plans[previous->getEnemyPlan()].playedAfterLoss[current->getEnemyPlan()]++;
+            log << "\nCurrent " << OpeningPlanString(current->getEnemyPlan()) << ", previous " << OpeningPlanString(previous->getEnemyPlan());
+            if (current->getWin())
+                log << " (win): ";
             else
-                plans[previous->getEnemyPlan()].playedAfterWin[current->getEnemyPlan()]++;
+                log << " (loss): ";
+
+            // Did the enemy use the same strategy as the previous game?
+            if (previous->getEnemyPlan() == current->getEnemyPlan())
+            {
+                // Switch the alwaysSwitchesAfterLoss flag to false if we won the previous game
+                planInfo[int(previous->getEnemyPlan())].alwaysSwitchesAfterLoss =
+                    planInfo[int(previous->getEnemyPlan())].alwaysSwitchesAfterLoss &&
+                    !previous->getWin();
+            }
+            else
+            {
+                // Switch the alwaysPlaysAfterWin flag to false if we lost the previous game
+                planInfo[int(previous->getEnemyPlan())].alwaysPlaysAfterWin =
+                    planInfo[int(previous->getEnemyPlan())].alwaysPlaysAfterWin &&
+                    previous->getWin();
+            }
+
+            log << "alwaysSwitchesAfterLoss=" << planInfo[int(previous->getEnemyPlan())].alwaysSwitchesAfterLoss;
+            log << "; alwaysPlaysAfterWin=" << planInfo[int(previous->getEnemyPlan())].alwaysPlaysAfterWin;
         }
-        
+
         previous = current;
     }
 
-    std::ostringstream log;
-    log << "Enemy plan summary:";
-    for (auto & plan : plans)
-    {
-        log << "\nPlans played after winning with " << OpeningPlanString(plan.first) << ":";
-        for (auto & win : plan.second.playedAfterWin)
-            log << "\n" << OpeningPlanString(win.first) << ": " << win.second;
-
-        log << "\nPlans played after losing with " << OpeningPlanString(plan.first) << ":";
-        for (auto & win : plan.second.playedAfterLoss)
-            log << "\n" << OpeningPlanString(win.first) << ": " << win.second;
-    }
-    Log().Debug() << log.str();
-
-    // Step 2: predict most likely plan based on what happened in the last game
-    OpeningPlan expectedEnemyPlan = OpeningPlan::Unknown;
-    for (auto it = _pastGameRecords.rbegin(); it != _pastGameRecords.rend(); it++)
-    {
+	// 3. Perform backwards pass to weight the opponent plans
+	double weight = 100000.0;
+    int count = 0;
+    for (auto it = _pastGameRecords.rbegin(); it != _pastGameRecords.rend() && count < 25; it++)
+	{
         auto record = *it;
+        count++;
 
-        // Advance through the list until we find a record with a known enemy plan
-        if (!_gameRecord.sameMatchup(*record)) continue;
-        if (record->getEnemyPlan() == OpeningPlan::Unknown) continue;
+		if (_gameRecord.sameMatchup(*record))
+		{
+            log << "\n" << count << ": " << OpeningPlanString(record->getEnemyPlan());
+            if (record->getWin())
+                log << " (win): ";
+            else
+                log << " (loss): ";
 
-        // Default to assuming the enemy will try this plan again
-        expectedEnemyPlan = record->getEnemyPlan();
+			PlanInfoType & info = planInfo[int(record->getEnemyPlan())];
+			info.games += 1;
 
-        // Try to find information about what the enemy does with this plan
-        auto planData = plans.find(expectedEnemyPlan);
-        if (planData != plans.end())
-        {
-            // Reference the correct map depending on whether the enemy won or lost the game
-            auto & planOutcomes =
-                record->getWin() ? planData->second.playedAfterLoss : planData->second.playedAfterWin;
-
-            // Find the plan with the most occurrances
-            OpeningPlan mostCommonPlan = OpeningPlan::Unknown;
-            int mostCommonCount = 0;
-            for (auto & outcome : planOutcomes)
+            // If this is the most recent game, check if the enemy will definitely use the plan from the previous game again
+            if (count == 1 && !record->getWin() && info.alwaysPlaysAfterWin)
             {
-                if (outcome.second > mostCommonCount)
-                {
-                    mostCommonCount = outcome.second;
-                    mostCommonPlan = outcome.first;
-                }
+                log << "Enemy always continues with this plan after a win; short-circuiting";
+                Log().Debug() << log.str();
+                return record->getEnemyPlan();
             }
 
-            // Set expected plan if we got a result
-            if (mostCommonPlan != OpeningPlan::Unknown)
-                expectedEnemyPlan = mostCommonPlan;
-        }
+            // If this is the most recent game, check if the enemy will definitely switch strategies from the previous game
+            if (count == 1 && record->getWin() && info.alwaysSwitchesAfterLoss)
+            {
+                info.weight = -1000000.0;
+                log << "Enemy never continues this plan after a loss";
+            }
 
-        break;
+            else
+            {
+                // Weight games we won lower
+                double change = weight * (record->getWin() ? 0.5 : 1.0);
+                info.weight += weight * (record->getWin() ? 0.5 : 1.0);
+                log << "Increased by " << change << " to " << info.weight;
+            }
+
+            // more recent game records are more heavily weighted
+			weight *= 0.8;
+		}
+	}
+
+	// 3. Decide.
+	// For now, set the most heavily weighted plan other than Unknown as the expected plan. Ignore the other info.
+	OpeningPlan bestPlan = OpeningPlan::Unknown;
+	double bestWeight = 0.0;
+	for (int plan = int(OpeningPlan::Unknown) + 1; plan < int(OpeningPlan::Size); ++plan)
+	{
+		if (planInfo[plan].weight > bestWeight)
+		{
+			bestPlan = OpeningPlan(plan);
+			bestWeight = planInfo[plan].weight;
+		}
+	}
+
+    if (count > 0)
+    {
+        log << "\nDecided on " << OpeningPlanString(bestPlan);
+        Log().Debug() << log.str();
     }
 
-    Log().Debug() << "Decided on " << OpeningPlanString(expectedEnemyPlan);
-
-	return expectedEnemyPlan;
+	return bestPlan;
 }
 
 // Does the opponent seem to play the same strategy every game?
@@ -240,7 +282,7 @@ void OpponentModel::considerOpenings()
 	double nAlwaysWins = 0.0;
 	std::string alwaysWinsOnThisMap;
 	double nAlwaysWinsOnThisMap = 0.0;
-	for (auto & item : openingInfo)
+	for (auto item : openingInfo)
 	{
 		const OpeningInfoType & info = item.second;
 		if (info.sameWins + info.otherWins > 0 && info.sameWins + info.otherWins == info.sameGames + info.otherGames)
@@ -445,6 +487,12 @@ void OpponentModel::considerGasSteal()
 	//	nStealWins, nStealTries, stealUCB);
 
 	_recommendGasSteal = stealUCB > plainUCB;
+
+	//偷气
+	if (BWAPI::Broodwar->enemy()->getRace() == BWAPI::Races::Terran)
+	{
+		_recommendGasSteal = true;
+	}
 }
 
 // Find the past game record which best matches the current game and remember it.
@@ -493,7 +541,7 @@ OpponentModel::OpponentModel()
 	, _expectedPylonHarassBehaviour(0)
 	, _pylonHarassBehaviour(0)
 {
-	_filename = "om_" + InformationManager::Instance().getEnemyName() + ".txt";
+	_filename = "DaQin_vs_" + InformationManager::Instance().getEnemyName() + ".txt";
 }
 
 void OpponentModel::readFile(std::string filename)
@@ -855,32 +903,13 @@ std::map<std::string, double> OpponentModel::getStrategyWeightFactors() const
     std::ostringstream log;
     log << "Deciding strategy weight factors:";
 
-    // If we have a game record in the past 25 games where the enemy used the expected plan for this game,
-    // only consider games that used this plan
-    bool onlyConsiderSamePlan = false;
-    int count = 0;
-    if (_expectedEnemyPlan != OpeningPlan::Unknown && _expectedEnemyPlan != OpeningPlan::NotFastRush)
-        for (auto it = _pastGameRecords.rbegin(); it != _pastGameRecords.rend() && count < 25; it++)
-        {
-            if (!_gameRecord.sameMatchup(**it)) continue;
-            count++;
-
-            if ((*it)->getEnemyPlan() == _expectedEnemyPlan)
-            {
-                onlyConsiderSamePlan = true;
-                break;
-            }
-        }
-
     // Compute a factor to adjust the weight for each strategy
     // More recent results are weighted more heavily
     // Results on the same map are weighted more heavily
-    count = 0;
+    int count = 0;
 	for (auto it = _pastGameRecords.rbegin(); it != _pastGameRecords.rend(); it++)
 	{
 		if (!_gameRecord.sameMatchup(**it)) continue;
-        if (onlyConsiderSamePlan && (*it)->getEnemyPlan() != _expectedEnemyPlan) continue;
-
         count++;
         bool sameMap = (*it)->getMapName() == BWAPI::Broodwar->mapFileName();
 
@@ -890,7 +919,11 @@ std::map<std::string, double> OpponentModel::getStrategyWeightFactors() const
 
 		if (result.find(strategy) == result.end())
 		{
-            result[strategy] = 1.0;
+            // Our proxy 2-gate is given a boost on 2-player maps
+            if (strategy == "Proxy9-9Gate" && BWAPI::Broodwar->getStartLocations().size() == 2)
+			    result[strategy] = 1.5;
+            else
+                result[strategy] = 1.0;
 			strategyCount[strategy] = 0;
             strategyLosses[strategy] = 0;
 		}
@@ -920,10 +953,13 @@ std::map<std::string, double> OpponentModel::getStrategyWeightFactors() const
     // Analyze the losses
     for (auto it = strategyLosses.begin(); it != strategyLosses.end(); it++)
     {
-        // Any strategies that have never lost are given a boost
+        // Any strategies that have never lost are given a large boost
+        // When in tournament mode, a similar boost is given to strategies that haven't been played in ParseUtils
+        // This should allow us to avoid getting stuck on a strategy that wins 90% of the time,
+        // if another strategy wins 100% of the time
         if (it->second == 0)
         {
-            result[it->first] = result[it->first] * 2;
+            result[it->first] = result[it->first] * 100;
             log << "\nBoosting " << it->first << " to " << result[it->first] << " as it has never lost";
         }
 
@@ -955,6 +991,7 @@ void OpponentModel::setPylonHarassObservation(PylonHarassBehaviour observation)
     }
 }
 
+//预计隐形战斗部队很快就会出现
 bool OpponentModel::expectCloakedCombatUnitsSoon()
 {
 	return _worstCaseExpectedCloakTech < (

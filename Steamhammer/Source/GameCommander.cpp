@@ -4,7 +4,7 @@
 #include "UnitUtil.h"
 #include "PathFinding.h"
 
-using namespace UAlbertaBot;
+using namespace DaQinBot;
 
 //#define CRASH_DEBUG 1
 
@@ -31,7 +31,7 @@ void GameCommander::update()
 #endif
 
 	// Decide whether to give up early. Implements config option SurrenderWhenHopeIsLost.
-	if (surrenderMonkey()/* || BWAPI::Broodwar->getFrameCount() == 30000*/)
+	if (surrenderMonkey())
 	{
 		_surrenderTime = BWAPI::Broodwar->getFrameCount();
 		BWAPI::Broodwar->printf("gg");
@@ -450,7 +450,6 @@ void GameCommander::onUnitDestroy(BWAPI::Unit unit)
 	ProductionManager::Instance().onUnitDestroy(unit);
 	WorkerManager::Instance().onUnitDestroy(unit);
 	InformationManager::Instance().onUnitDestroy(unit); 
-	StrategyManager::Instance().onUnitDestroy(unit); 
 }
 
 void GameCommander::onUnitMorph(BWAPI::Unit unit)		
@@ -461,11 +460,6 @@ void GameCommander::onUnitMorph(BWAPI::Unit unit)
 
 BWAPI::Unit GameCommander::getScoutWorker()
 {
-    // If there is a proxy builder, use it
-    // We set up the build timings such that it will have time to scout before being required for more proxy buildings
-    if (WorkerManager::Instance().getProxyBuilder())
-        return WorkerManager::Instance().getProxyBuilder();
-
 	// We get the free worker closest to the center of the map by ground
     BWAPI::Position mapCenter(BWAPI::TilePosition(BWAPI::Broodwar->mapWidth() / 2, BWAPI::Broodwar->mapHeight() / 2));
 	BWAPI::Unit bestUnit = nullptr;
@@ -480,7 +474,7 @@ BWAPI::Unit GameCommander::getScoutWorker()
 			!unit->isCarryingGas() &&
 			unit->getOrder() != BWAPI::Orders::MiningMinerals)
 		{
-            int dist = PathFinding::GetGroundDistance(unit->getPosition(), mapCenter, unit->getType());
+            int dist = PathFinding::GetGroundDistance(unit->getPosition(), mapCenter);
 			if (dist < bestDist)
 			{
 				bestDist = dist;

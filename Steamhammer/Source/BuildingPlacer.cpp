@@ -6,7 +6,7 @@
 #include "MapTools.h"
 #include "PathFinding.h"
 
-using namespace UAlbertaBot;
+using namespace DaQinBot;
 
 namespace { auto & bwemMap = BWEM::Map::Instance(); }
 namespace { auto & bwebMap = BWEB::Map::Instance(); }
@@ -289,7 +289,6 @@ void BuildingPlacer::reserveTiles(BWAPI::TilePosition position,int width,int hei
 
 			_reserveMap[x][y] = true;
 			bwebMap.getUsedTiles().insert(t);
-            bwebMap.usedTilesGrid[x][y] = true;
 		}
     }
 }
@@ -335,7 +334,6 @@ void BuildingPlacer::freeTiles(BWAPI::TilePosition position, int width, int heig
 			
 			_reserveMap[x][y] = false;
 			bwebMap.getUsedTiles().erase(t);
-            bwebMap.usedTilesGrid[x][y] = false;
 		}
     }
 }
@@ -398,7 +396,6 @@ void BuildingPlacer::initializeBWEB()
 
     findHiddenTechBlock();
     findProxyBlocks();
-    findChokeDefenseLocations();
 
     bwebMap.findBlocks();
 }
@@ -617,51 +614,26 @@ void BuildingPlacer::findProxyBlocks()
             for (int y = 0; y <= unit->getType().tileHeight(); y++)
                 insertWithCollision(unit->getTilePosition() + BWAPI::TilePosition(x, y), unbuildableTiles);
 
-    // Hard-coded for Plasma
-    if (BWAPI::Broodwar->mapHash() == "6f5295624a7e3887470f3f2e14727b1411321a67")
+    // For base-specific locations, avoid all areas likely to be traversed by worker scouts
+    std::set<const BWEM::Area*> areasToAvoid;
+    for (auto first : BWTA::getStartLocations())
     {
-        for (auto base : BWTA::getStartLocations())
+        for (auto second : BWTA::getStartLocations())
         {
-            if (base->getTilePosition().y == 110)
+            if (first == second) continue;
+
+            for (auto choke : PathFinding::GetChokePointPath(first->getPosition(), second->getPosition(), BWAPI::UnitTypes::Protoss_Probe, PathFinding::PathFindingOptions::UseNearestBWEMArea))
             {
-                _baseProxyBlocks[base] = addProxyBlock(BWAPI::TilePosition(48,123), unbuildableTiles);
-            }
-            else if (base->getTilePosition().y == 14)
-            {
-                _baseProxyBlocks[base] = addProxyBlock(BWAPI::TilePosition(1,45), unbuildableTiles);
-            }
-            else
-            {
-                _baseProxyBlocks[base] = addProxyBlock(BWAPI::TilePosition(91,92), unbuildableTiles);
+                areasToAvoid.insert(choke->GetAreas().first);
+                areasToAvoid.insert(choke->GetAreas().second);
             }
         }
 
-        return;
+        // Also add any areas that neighbour each start location
+        auto baseArea = bwemMap.GetNearestArea(first->getTilePosition());
+        for (auto area : baseArea->AccessibleNeighbours())
+            areasToAvoid.insert(area);
     }
-
-    // For base-specific locations, avoid all areas likely to be traversed by worker scouts
-    std::set<const BWEM::Area*> areasToAvoid;
-	if (BWAPI::Broodwar->mapHash() != "6f5295624a7e3887470f3f2e14727b1411321a67") // disabled on Plasma
-	{
-		for (auto first : BWTA::getStartLocations())
-		{
-			for (auto second : BWTA::getStartLocations())
-			{
-				if (first == second) continue;
-
-				for (auto choke : PathFinding::GetChokePointPath(first->getPosition(), second->getPosition(), BWAPI::UnitTypes::Protoss_Probe, PathFinding::PathFindingOptions::UseNearestBWEMArea))
-				{
-					areasToAvoid.insert(choke->GetAreas().first);
-					areasToAvoid.insert(choke->GetAreas().second);
-				}
-			}
-
-			// Also add any areas that neighbour each start location
-			auto baseArea = bwemMap.GetNearestArea(first->getTilePosition());
-			for (auto area : baseArea->AccessibleNeighbours())
-				areasToAvoid.insert(area);
-		}
-	}
 
     // Gather the possible enemy start locations
     std::vector<BWTA::BaseLocation*> enemyStartLocations;
@@ -690,10 +662,6 @@ void BuildingPlacer::findProxyBlocks()
 
     std::ostringstream debug;
     debug << "Finding proxy locations";
-
-    // By default place base proxy blocks at least 2000 pixels away from the base, though we accept a bit closer on Plasma
-    int minDistCutoff = 2000;
-    if (BWAPI::Broodwar->mapHash() == "6f5295624a7e3887470f3f2e14727b1411321a67") minDistCutoff = 1500;
 
     // Find the best locations
     BWAPI::Position mainPosition = InformationManager::Instance().getMyMainBaseLocation()->getPosition();
@@ -724,7 +692,7 @@ void BuildingPlacer::findProxyBlocks()
                 debug << "base@" << base->getTilePosition() << ": ";
 
                 // Don't build horror gates
-                if (BWTA::getRegion(BWAPI::TilePosition(blockCenter)) == base->getRegion())
+                if (BWTA::getRegion(blockCenter) == base->getRegion())
                 {
                     debug << "In base region. ";
                     inStartLocationRegion = true;
@@ -736,7 +704,7 @@ void BuildingPlacer::findProxyBlocks()
                 if (dist == -1)
                 {
                     debug << "Not connected. ";
-					continue;
+                    goto nextTile;
                 }
 
                 debug << "dist=" << dist;
@@ -745,7 +713,7 @@ void BuildingPlacer::findProxyBlocks()
                 if (dist < minDist) minDist = dist;
                 if (dist > maxDist) maxDist = dist;
 
-                if (dist >= distBest[base] || dist < minDistCutoff)
+                if (dist >= distBest[base] || dist < 2000)
                 {
                     debug << ". ";
                     continue;
@@ -822,7 +790,7 @@ void BuildingPlacer::findProxyBlocks()
                 debug << "base@" << base->getTilePosition() << ": ";
 
                 // Don't build horror gates
-                if (BWTA::getRegion(BWAPI::TilePosition(blockCenter)) == base->getRegion())
+                if (BWTA::getRegion(blockCenter) == base->getRegion())
                 {
                     debug << "In base region. ";
                     inStartLocationRegion = true;
@@ -946,30 +914,6 @@ struct BlockData
 
 BWAPI::TilePosition BuildingPlacer::placeBuildingBWEB(BWAPI::UnitType type, BWAPI::TilePosition closeTo, MacroLocation macroLocation)
 {
-    if (macroLocation == MacroLocation::Choke && _chokeDefenseLocations.size() > 1)
-    {
-        if (type == BWAPI::UnitTypes::Protoss_Pylon) return _chokeDefenseLocations[0];
-
-        // Gather placements we have queued in the building manager
-        std::set<BWAPI::TilePosition> queuedCannonPlacements;
-        for (auto & b : BuildingManager::Instance().buildingsQueued())
-            if (b->type == BWAPI::UnitTypes::Protoss_Photon_Cannon && b->finalPosition.isValid())
-                queuedCannonPlacements.insert(b->finalPosition);
-
-        // Find the next available cannon placement
-        for (int i=1; i<_chokeDefenseLocations.size(); i++)
-        {
-            auto tile = _chokeDefenseLocations[i];
-            if (bwebMap.usedTiles.find(tile) == bwebMap.usedTiles.end() &&
-                queuedCannonPlacements.find(tile) == queuedCannonPlacements.end())
-            {
-                return tile;
-            }
-        }
-
-        // Fall through to place cannon normally
-    }
-
 	if (type == BWAPI::UnitTypes::Protoss_Photon_Cannon)
 	{
 		const BWEB::Station* station = bwebMap.getClosestStation(closeTo);
@@ -978,6 +922,17 @@ BWAPI::TilePosition BuildingPlacer::placeBuildingBWEB(BWAPI::UnitType type, BWAP
 				return tile;
 
 		return BWAPI::TilePositions::Invalid;
+	}
+
+	if (type == BWAPI::UnitTypes::Protoss_Gateway)
+	{
+		if (bwebMap.mainArea && bwebMap.mainChoke) {
+			BWAPI::Position start = InformationManager::Instance().getMyMainBaseLocation()->getPosition();
+			BWAPI::Position end = BWAPI::Position(bwebMap.mainChoke->Center());
+
+			closeTo = BWAPI::TilePosition(MapTools::Instance().getDistancePosition(start, end, start.getDistance(end) / 2));
+			//return closeTo;
+		}
 	}
 
     if (macroLocation == MacroLocation::Proxy)
@@ -1018,6 +973,7 @@ BWAPI::TilePosition BuildingPlacer::placeBuildingBWEB(BWAPI::UnitType type, BWAP
 			return bwebMap.startBlockPylon;
 
         // If we have an active proxy, build the pylon as far away from the main choke as possible
+		//如果我们有一个活动的代理，请尽可能地将塔架建在远离主扼流圈的地方
         if (StrategyManager::Instance().isProxying() &&
             macroLocation == MacroLocation::Anywhere && bwebMap.mainArea && bwebMap.mainChoke)
         {
@@ -1207,10 +1163,12 @@ void BuildingPlacer::reserveWall(const BuildOrder & buildOrder)
 
 bool BuildingPlacer::isCloseToProxyBlock(BWAPI::Unit unit)
 {
-    auto proxyLocation = getProxyBlockLocation();
-    if (!proxyLocation.isValid()) return false;
+    if (_proxyBlock == -1) return false;
 
-    return unit->getPosition().getApproxDistance(proxyLocation) < 400;
+    return unit->getDistance(
+        BWAPI::Position(bwebMap.Blocks()[_proxyBlock].Location()) +
+        BWAPI::Position(bwebMap.Blocks()[_proxyBlock].width() * 16, bwebMap.Blocks()[_proxyBlock].height() * 16))
+            < 320;
 }
 
 BWAPI::Position BuildingPlacer::getProxyBlockLocation() const
@@ -1220,103 +1178,4 @@ BWAPI::Position BuildingPlacer::getProxyBlockLocation() const
     return 
         BWAPI::Position(bwebMap.Blocks()[_proxyBlock].Location()) +
         BWAPI::Position(bwebMap.Blocks()[_proxyBlock].width() * 16, bwebMap.Blocks()[_proxyBlock].height() * 16);
-}
-
-bool powersCannon(BWAPI::TilePosition pylon, BWAPI::TilePosition cannon)
-{
-    int offsetY = cannon.y - pylon.y;
-    int offsetX = cannon.x - pylon.x;
-
-    if (offsetY < -4 || offsetY > 4) return false;
-    if (offsetY == 4 && (offsetX < -3 || offsetX > 2)) return false;
-    if ((offsetY == -4 || offsetY == 3) && (offsetX < -6 || offsetX > 5)) return false;
-    if ((offsetY == -3 || offsetY == 2) && (offsetX < -7 || offsetX > 6)) return false;
-    return (offsetX >= -7 && offsetX <= 7);
-}
-
-void BuildingPlacer::findChokeDefenseLocations()
-{
-    if (!bwebMap.mainChoke) return;
-    if (!bwebMap.mainArea) return;
-
-    auto start = BWAPI::TilePosition(bwebMap.mainChoke->Center());
-    auto chokePos = BWAPI::Position(bwebMap.mainChoke->Center()) + BWAPI::Position(2,2);
-
-    // Reserve a path
-    std::set<BWAPI::TilePosition> reserved;
-    for (auto & tile : bwebMap.findPath(bwemMap, bwebMap, BWAPI::Broodwar->self()->getStartLocation(), start))
-    {
-        reserved.insert(tile);
-    }
-
-    BWAPI::TilePosition pylon = BWAPI::TilePositions::Invalid;
-    int best = INT_MAX;
-    for (int x=start.x-10; x<=start.x+10; x++)
-    {
-        for (int y=start.y-10; y<=start.y+10; y++)
-        {
-            BWAPI::TilePosition here(x,y);
-            if (bwebMap.overlapsAnything(here, 2, 2)) continue;
-            if (!bwebMap.isPlaceable(BWAPI::UnitTypes::Protoss_Pylon, here)) continue;
-            if (bwemMap.GetArea(here) == bwebMap.naturalArea) continue;
-            if (reserved.find(here) != reserved.end()) continue;
-            if (reserved.find(here + BWAPI::TilePosition(1,0)) != reserved.end()) continue;
-            if (reserved.find(here + BWAPI::TilePosition(1,1)) != reserved.end()) continue;
-            if (reserved.find(here + BWAPI::TilePosition(0,1)) != reserved.end()) continue;
-
-            int dist = chokePos.getApproxDistance(BWAPI::Position(here) + BWAPI::Position(32, 32));
-            if (dist < best)
-            {
-                best = dist;
-                pylon = here;
-            }
-        }
-    }
-
-    if (!pylon.isValid())
-    {
-        Log().Get() << "Choke defense: could not find pylon location";
-        return;
-    }
-
-    Log().Get() << "Choke defense: pylon @ " << pylon;
-    bwebMap.addOverlap(pylon, 2, 2);
-    _chokeDefenseLocations.push_back(pylon);
-
-    for (int i=0; i<4; i++)
-    {
-        BWAPI::TilePosition cannon = BWAPI::TilePositions::Invalid;
-        best = INT_MAX;
-        for (int x=pylon.x-7; x<=pylon.x+7; x++)
-        {
-            for (int y=pylon.y-4; y<=pylon.y+4; y++)
-            {
-                BWAPI::TilePosition here(x,y);
-                if (bwebMap.overlapsAnything(here, 2, 2)) continue;
-                if (!bwebMap.isPlaceable(BWAPI::UnitTypes::Protoss_Pylon, here)) continue;
-                if (bwemMap.GetArea(here) == bwebMap.naturalArea) continue;
-                if (!powersCannon(pylon, here)) continue;
-                if (reserved.find(here) != reserved.end()) continue;
-                if (reserved.find(here + BWAPI::TilePosition(1,0)) != reserved.end()) continue;
-                if (reserved.find(here + BWAPI::TilePosition(1,1)) != reserved.end()) continue;
-                if (reserved.find(here + BWAPI::TilePosition(0,1)) != reserved.end()) continue;
-
-                int dist = chokePos.getApproxDistance(BWAPI::Position(here) + BWAPI::Position(32, 32));
-                if (dist < best)
-                {
-                    best = dist;
-                    cannon = here;
-                }
-            }
-        }
-
-        if (!cannon.isValid())
-        {
-            return;
-        }
-
-        Log().Get() << "Choke defense: cannon @ " << cannon;
-        bwebMap.addOverlap(cannon, 2, 2);
-        _chokeDefenseLocations.push_back(cannon);
-    }
 }

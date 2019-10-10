@@ -102,13 +102,6 @@ namespace BWEB
 
 	void Map::findMainChoke()
 	{
-		// Alchemist has two chokes
-		if (BWAPI::Broodwar->mapHash() == "8000dc6116e405ab878c14bb0f0cde8efa4d640c")
-		{
-			mainChoke = nullptr;
-			return;
-		}
-
 		auto distBest = DBL_MAX;
 		for (auto& choke : naturalArea->ChokePoints())
 		{
@@ -120,12 +113,6 @@ namespace BWEB
 
 	void Map::findNaturalChoke()
 	{
-		if (!mainChoke)
-		{
-			naturalChoke = nullptr;
-			return;
-		}
-		
 		// Exception for maps with a natural behind the main such as Crossing Fields
 		if (getGroundDistance(mainPosition, mapBWEM.Center()) < getGroundDistance(Position(naturalTile), mapBWEM.Center()))
 		{
